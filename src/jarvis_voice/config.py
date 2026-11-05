@@ -21,6 +21,8 @@ DEFAULTS: dict = {
     "address": "sir",              # how Jarvis addresses you
     "chimes": True,
     # listening
+    "wake": True,                  # jarvis talk: wait for "Hey Jarvis" (False = always listening)
+    "wake_timeout": 10.0,          # seconds of silence before going back to standby
     "whisper": "base.en",
     "silence": 1.0,
     "sensitivity": 3.0,

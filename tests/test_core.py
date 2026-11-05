@@ -1,7 +1,7 @@
 import json
 
 from jarvis_voice import config, hooks
-from jarvis_voice.cli import extract_wake
+from jarvis_voice.cli import extract_wake, is_sleep_phrase
 from jarvis_voice.voice import clean_for_speech, split_sentences
 
 
@@ -16,8 +16,20 @@ def test_clean_for_speech_strips_markdown():
 
 def test_wake_word():
     assert extract_wake("Hey Jarvis, what's the time?") == ("what's the time?", True)
+    assert extract_wake("Hey, Jarvis.") == (None, True)
     assert extract_wake("Jarvis.") == (None, True)
+    assert extract_wake("Okay Jervis open the report") == ("open the report", True)
+    assert extract_wake("Hey Travis, what's the weather?") == ("what's the weather?", True)  # common mishearing
     assert extract_wake("what's the time?") == (None, False)
+    assert extract_wake("Travis Scott has a new album") == (None, False)  # plain name, no greeting
+    assert extract_wake("customer service was slow") == (None, False)
+
+
+def test_sleep_phrases():
+    assert is_sleep_phrase("That's all.")
+    assert is_sleep_phrase("Thank you, Jarvis.")
+    assert is_sleep_phrase("ok stand by")
+    assert not is_sleep_phrase("What's all this about?")
 
 
 def test_spoken_excerpt_stops_at_code_and_length():

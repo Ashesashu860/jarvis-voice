@@ -5,7 +5,7 @@
 - 🎙️ **Speak your prompts.** In Claude Code, run `/jarvis:listen` and just talk. Speech is transcribed locally with Whisper.
 - 🔊 **Hear the replies.** Claude's answers are read aloud as they finish, in a calm, crisp British voice with a subtle "AI" sheen.
 - 🤵 **The manner too.** While voice mode is on, Claude opens each reply with a short spoken summary in a composed, dry-witted butler style.
-- 🗣️ **Hands-free mode.** `jarvis talk` is a continuous voice conversation with Claude (optional "Jarvis, ..." wake word).
+- 🗣️ **Hands-free mode.** `jarvis talk` stays on standby until you say **"Hey Jarvis"**, converses, then goes back to standby after 10 s of silence.
 - 🔒 **Local and offline voice.** Text-to-speech (Kokoro) and speech-to-text (Whisper) both run on your machine. No audio leaves it.
 
 > **About the voice.** This project does **not** clone, sample or imitate any actor's voice or any film audio.
@@ -66,12 +66,23 @@ skipping code blocks and tables. The rest stays on screen.
 ### Hands-free conversation
 
 ```bash
-jarvis talk            # always listening: just speak
-jarvis talk --wake     # responds only to "Jarvis, ..."
-jarvis talk --type     # type prompts, hear replies
+jarvis talk                    # waits for "Hey Jarvis", then converses
+jarvis talk --wake-timeout 20  # stay awake longer between follow-ups
+jarvis talk --always           # no wake word: every utterance is a prompt
+jarvis talk --type             # type prompts, hear replies
 ```
 
+How the wake word works:
+
+1. **Standby.** The session is on, but Jarvis ignores everything until it hears **"Hey Jarvis"**.
+   Speech is transcribed locally and thrown away unless it contains the wake phrase.
+2. **Awake.** "Hey Jarvis" on its own gets "Yes, sir?". "Hey Jarvis, what's on my calendar?" is answered straight away.
+   After each reply a *tink* means it's listening for a follow-up, so there's no need to say "Hey Jarvis" again.
+3. **Back to standby** after **10 seconds of silence** (a soft *bottle* sound), or straight away when you say
+   "that's all", "stand by" or "thank you, Jarvis".
+
 Say "new conversation" to clear context, or "goodbye" to quit. Ctrl+C interrupts.
+Jarvis doesn't hear itself: audio picked up while it speaks is thrown away, so wait for the *tink* before replying.
 By default Claude may read files and search the web without asking. Add `--permission-mode acceptEdits` to let it edit files too.
 
 ### Other commands
@@ -99,6 +110,8 @@ Stored in `~/.config/jarvis-voice/config.json`. Change them with `jarvis config 
 | `speak_replies` | `true` | Read Claude Code replies aloud |
 | `persona_in_claude_code` | `true` | Give Claude the Jarvis manner while voice is on |
 | `max_spoken_chars` | `600` | How much of a reply to read aloud |
+| `wake` | `true` | `jarvis talk` waits for "Hey Jarvis" (`false` means always listening) |
+| `wake_timeout` | `10` | Seconds of silence before going back to standby |
 | `whisper` | `base.en` | Speech model: `tiny.en` (fastest) … `small.en` (more accurate) |
 | `silence` | `1.0` | Seconds of silence that end your turn |
 | `sensitivity` | `3.0` | Mic threshold over background noise. Lower is more sensitive |

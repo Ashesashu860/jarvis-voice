@@ -29,12 +29,30 @@ def voice_overrides(args) -> dict:
 
 
 # ----------------------------------------------------------------------------- talk
+# "Jarvis" plus the ways speech recognition commonly mishears it. Mishearings that are
+# also ordinary words only count right after a greeting ("hey travis").
+_JARVIS = r"(?:jarvis|jarviss|jervis|jarvus|javis|jarvas|charvis|garvis)"
+_MISHEARD = r"(?:travis|davis|service|jarvis's|harvest)"
+_GREETING = r"(?:hey|hi|hello|okay|ok|yo)"
+WAKE_RE = re.compile(
+    rf"\b(?:{_GREETING}[\s,.!]+)?{_JARVIS}\b|\b{_GREETING}[\s,.!]+{_MISHEARD}\b", re.I)
+SLEEP_PHRASES = ("thats all", "that is all", "stand by", "standby", "go to sleep", "thank you jarvis",
+                 "thanks jarvis", "never mind", "nevermind", "dismissed")
+
+
 def extract_wake(text: str) -> tuple[str | None, bool]:
-    """(prompt, woke): only text after 'Jarvis' counts in wake-word mode."""
-    m = re.search(r"\b(jarvis|jervis|travis|jarvus|javis)\b[,.!?]?\s*(.*)", text, re.I | re.S)
+    """(prompt, woke): woke if the wake phrase is present; prompt is what follows it."""
+    m = WAKE_RE.search(text)
     if not m:
         return None, False
-    return (m.group(2).strip() or None), True
+    rest = text[m.end():].lstrip(" ,.!?;:-").strip()
+    return (rest or None), True
+
+
+def is_sleep_phrase(text: str) -> bool:
+    from .ears import normalize
+    n = normalize(text)
+    return any(n == p or n.startswith(p + " ") or n.endswith(" " + p) for p in SLEEP_PHRASES)
 
 
 def cmd_talk(args, cfg) -> int:
@@ -55,65 +73,112 @@ def cmd_talk(args, cfg) -> int:
         print(f"{C_DIM}Calibrating microphone, stay quiet for a second...{C_RST}")
         listener = Listener(cfg["silence"], 30.0, cfg["sensitivity"])
 
+    wake = cfg["wake"] if args.wake is None else args.wake
+    wake = wake and not args.type
+    timeout = args.wake_timeout or cfg["wake_timeout"]
     mode = ("type your request and press Enter" if args.type
-            else "say 'Jarvis' followed by your request" if args.wake else "just speak")
+            else f"say 'Hey Jarvis' to begin; {timeout:g}s of silence returns to standby" if wake
+            else "always listening: just speak")
     print(f"{C_GRN}JARVIS online{C_RST} {C_DIM}(voice: {describe(cfg)}; {mode}; Ctrl+C interrupts, "
           f"say 'goodbye' or Ctrl+C twice to quit){C_RST}")
-    speaker.say(f"Good {time_of_day()}, {address}. JARVIS online and at your service.")
-    speaker.wait()
+    greeting = f"Good {time_of_day()}, {address}. JARVIS online"
+    speaker.say(greeting + (". Say 'Hey Jarvis' when you need me." if wake else " and at your service."))
 
-    awaiting_followup, last_interrupt = False, 0.0
+    def finish_speaking():
+        """Wait for Jarvis to stop talking, then drop what the mic heard meanwhile."""
+        speaker.wait()
+        if listener:
+            listener.flush()
+
+    if listener:
+        listener.start_continuous()
+    finish_speaking()
+
+    def standby_notice():
+        print(f"{C_DIM}[standby: say 'Hey Jarvis']{C_RST}            ")
+
+    # Wake mode is a small state machine: STANDBY (ignore everything but the wake phrase)
+    # -> ACTIVE (every utterance is a prompt) -> back to STANDBY after `timeout` s of silence.
+    active = not wake
+    if wake:
+        standby_notice()
+    last_interrupt = 0.0
     while True:
         try:
+            # ---- get the user's words
             if args.type:
                 text = input(f"{C_GRN}You:{C_RST} ").strip()
             else:
-                chime("Tink", cfg)
-                print(f"{C_DIM}listening...{C_RST}", end="\r", flush=True)
-                audio = listener.listen()
+                if active:
+                    chime("Tink", cfg, wait=True)
+                    listener.flush()
+                print(f"{C_DIM}{'listening...' if active else 'standing by...'}{C_RST}", end="\r", flush=True)
+                audio = listener.listen(start_timeout=timeout if (wake and active) else None)
                 if audio is None:
+                    if listener.timed_out:  # silence: back to standby
+                        active = False
+                        chime("Bottle", cfg, wait=True)
+                        listener.flush()
+                        standby_notice()
                     continue
-                print(f"{C_DIM}transcribing...{C_RST}", end="\r", flush=True)
+                print(f"{C_DIM}transcribing...{C_RST}  ", end="\r", flush=True)
                 text = transcriber(audio)
                 if is_noise(text):
                     continue
-                print(f"{C_GRN}You:{C_RST} {text}            ")
+                if active or not wake:
+                    print(f"{C_GRN}You:{C_RST} {text}            ")
             if not text:
                 continue
 
-            if args.wake and not awaiting_followup:
-                prompt, woke = extract_wake(text)
-                if woke and not prompt:
-                    speaker.say(f"Yes, {address}?")
-                    speaker.wait()
-                    awaiting_followup = True
+            prompt = text
+            if wake:
+                woken_prompt, woke = extract_wake(text)
+                if not active:
+                    if not woke:
+                        print(f"{C_DIM}(ignored: {text}){C_RST}          ")
+                        continue
+                    active = True
+                    print(f"{C_GRN}You:{C_RST} {text}            ")
+                    if not woken_prompt:
+                        speaker.say(f"Yes, {address}?")
+                        finish_speaking()
+                        continue
+                    prompt = woken_prompt
+                elif woke:
+                    if not woken_prompt:  # "Hey Jarvis" again while already active
+                        speaker.say(f"Still here, {address}.")
+                        finish_speaking()
+                        continue
+                    prompt = woken_prompt
+                if is_sleep_phrase(prompt):
+                    speaker.say(f"Very good, {address}. Standing by.")
+                    finish_speaking()
+                    active = False
+                    standby_notice()
                     continue
-                if not prompt:
-                    continue
-            else:
-                prompt = text
-            awaiting_followup = False
 
             n = normalize(prompt)
             if any(n == p or n.startswith(p) for p in EXIT_PHRASES):
                 speaker.say(f"Very good, {address}. Powering down.")
-                speaker.wait()
+                finish_speaking()
                 return 0
             if any(p in n for p in RESET_PHRASES):
                 brain.session_id = None
                 speaker.say(f"Of course, {address}. Starting a fresh conversation.")
-                speaker.wait()
+                finish_speaking()
                 continue
 
             if not args.type:
                 chime("Pop", cfg)
             brain.ask(prompt, speaker)
-            speaker.wait()
+            finish_speaking()
         except KeyboardInterrupt:
             now = time.time()
             busy = speaker.busy.is_set() or brain.proc is not None
             brain.cancel()
             speaker.stop()
+            if listener:
+                listener.flush()
             if not busy and now - last_interrupt < 1.5:
                 print("\nGoodbye.")
                 return 0
@@ -320,7 +385,10 @@ def build_parser() -> argparse.ArgumentParser:
         return p
 
     p = voice_opts(sub.add_parser("talk", help="hands-free voice conversation with Claude"))
-    p.add_argument("--wake", action="store_true", help="only respond to 'Jarvis, ...'")
+    p.add_argument("--wake", dest="wake", action="store_true", default=None,
+                   help="wait for 'Hey Jarvis' (default; see `jarvis config set wake`)")
+    p.add_argument("--always", dest="wake", action="store_false", help="always listening, no wake word")
+    p.add_argument("--wake-timeout", type=float, help="seconds of silence before standby (default 10)")
     p.add_argument("--type", action="store_true", help="type prompts, hear replies")
     p.add_argument("--model", help="Claude model, e.g. sonnet, opus, haiku")
     p.add_argument("--cwd", help="directory Claude works in (default: current)")

@@ -42,10 +42,22 @@ class Listener:
         self.sensitivity = sensitivity
         self.q: queue.Queue[np.ndarray] = queue.Queue()
         self.enabled = threading.Event()
+        self.continuous = False
+        self.timed_out = False
         self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                                      blocksize=FRAME_LEN, callback=self._cb)
         self.stream.start()
         self.threshold = self._calibrate(calibrate_s)
+
+    def start_continuous(self):
+        """Keep recording between listen() calls, so speech that starts while the
+        previous utterance is being transcribed isn't lost. Call flush() after
+        Jarvis speaks or chimes, so it never hears itself."""
+        self.continuous = True
+        self.enabled.set()
+
+    def flush(self):
+        self._drain()
 
     def close(self):
         self.stream.stop()
@@ -78,15 +90,19 @@ class Listener:
         return max(self.noise * self.sensitivity, 0.008)
 
     def listen(self, start_timeout: float | None = None) -> np.ndarray | None:
-        """Block until one utterance is captured (or start_timeout passes with no speech)."""
-        self._drain()
-        self.enabled.set()
+        """Block until one utterance is captured. Returns None for a too-short sound,
+        or when start_timeout passes with no speech (then self.timed_out is True)."""
+        self.timed_out = False
+        if not self.continuous:
+            self._drain()
+            self.enabled.set()
         preroll: list[np.ndarray] = []
         voiced, frames, silent, started = 0, [], 0, False
         deadline = time.time() + start_timeout if start_timeout else None
         try:
             while True:
                 if not started and deadline and time.time() > deadline:
+                    self.timed_out = True
                     return None
                 try:
                     f = self.q.get(timeout=0.5)
@@ -108,7 +124,8 @@ class Listener:
                 if silent >= self.silence_frames or len(frames) >= self.max_frames:
                     break
         finally:
-            self.enabled.clear()
+            if not self.continuous:
+                self.enabled.clear()
         if len(frames) < 12:  # < ~0.35 s: a click, not speech
             return None
         return np.concatenate(frames)
