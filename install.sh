@@ -26,7 +26,10 @@ command -v jarvis >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"
 command -v jarvis >/dev/null 2>&1 || die "'jarvis' isn't on your PATH. Add ~/.local/bin to PATH and run: jarvis setup"
 
 say "Downloading models and checking your microphone"
-if [ -t 0 ] || [ -e /dev/tty ]; then jarvis setup < /dev/tty; else jarvis setup --yes; fi
+# Interactive setup needs a real terminal; under `curl | bash` stdin is the script, so use /dev/tty if it opens.
+if [ -t 0 ]; then jarvis setup
+elif (exec </dev/tty) 2>/dev/null; then jarvis setup </dev/tty
+else jarvis setup --yes; fi
 
 cat <<'MSG'
 
