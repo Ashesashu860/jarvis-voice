@@ -38,7 +38,10 @@ def claude_code_note(address: str) -> str:
         "[Jarvis voice mode is on: the opening of your final reply will be read aloud.] "
         "Begin your final reply with one or two short, plain sentences that answer or summarise, "
         "written to be spoken (no markdown, symbols or code in them), then give any detail as usual. "
-        f"For that spoken part, adopt the JARVIS manner. {STYLE} Address the user as '{address}'."
+        f"For that spoken part, adopt the JARVIS manner. {STYLE} Address the user as '{address}'. "
+        "While working on a multi-step task, your short text updates between tool calls are also "
+        "read aloud: before each major step, write one brief plain sentence saying what you're about "
+        "to do and how far along you are (e.g. 'Tests written; now running them.')."
     )
 
 
@@ -49,8 +52,17 @@ class Brain:
         self.tools, self.permission_mode = tools, permission_mode
         self.session_id: str | None = None
         self.proc: subprocess.Popen | None = None
+        self.cancelled = False
 
     def ask(self, prompt: str, speaker) -> None:
+        self.cancelled = False
+        real_speaker = speaker
+
+        class _Guard:  # drop sentences that arrive after cancel()
+            def say(_, text):
+                if not self.cancelled:
+                    real_speaker.say(text)
+        speaker = _Guard()
         cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
                "--include-partial-messages", "--append-system-prompt", persona(self.address)]
         if self.model:
@@ -99,13 +111,15 @@ class Brain:
                         said_wait = True
             elif t == "result":
                 self.session_id = ev.get("session_id") or self.session_id
-                if ev.get("is_error") and not full:
+                if ev.get("is_error") and not full and not self.cancelled:
                     speaker.say("I'm afraid something went wrong on my end.")
                     print(f"{C_YEL}{ev.get('result')}{C_RST}")
         if buf.strip():
             speaker.say(buf)
         self.proc.wait()
-        if self.proc.returncode and not full:
+        if self.cancelled:
+            print(f"{C_DIM} [cut short]{C_RST}", end="")
+        elif self.proc.returncode and not full:
             err = self.proc.stderr.read().strip()
             print(f"{C_YEL}claude exited {self.proc.returncode}: {err[:400]}{C_RST}")
             speaker.say("I'm afraid I couldn't reach my brain just now.")
@@ -113,5 +127,7 @@ class Brain:
         print()
 
     def cancel(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        self.cancelled = True
+        proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()

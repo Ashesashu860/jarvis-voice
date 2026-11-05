@@ -9,7 +9,7 @@
       "name": "jarvis",
       "source": "./plugin",
       "description": "Speak prompts with /jarvis:listen and hear Claude's replies in a refined British AI voice.",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "category": "productivity",
       "keywords": ["voice", "speech", "tts", "accessibility"]
     }

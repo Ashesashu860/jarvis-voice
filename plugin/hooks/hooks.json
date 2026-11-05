@@ -8,10 +8,26 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "command -v jarvis >/dev/null 2>&1 && jarvis hook tool || true", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "command -v jarvis >/dev/null 2>&1 && jarvis hook tool-done || true", "timeout": 10 }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "command -v jarvis >/dev/null 2>&1 && jarvis hook stop || true", "timeout": 10 }
+          { "type": "command", "command": "command -v jarvis >/dev/null 2>&1 && jarvis hook stop || true", "timeout": 600 }
         ]
       }
     ]

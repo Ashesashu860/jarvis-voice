@@ -40,6 +40,21 @@ SLEEP_PHRASES = ("thats all", "that is all", "stand by", "standby", "go to sleep
                  "thanks jarvis", "never mind", "nevermind", "dismissed")
 
 
+# Said over Jarvis, these just mean "stop talking and listen"; nothing is sent to Claude.
+PAUSE_PHRASES = ("stop", "wait", "hold on", "hang on", "pause", "quiet", "shush", "shh",
+                 "enough", "one second", "one sec", "just a second", "just a moment", "stop talking")
+INTERRUPT_NOTE = "[I interrupted your previous reply, so I may not have heard all of it.] "
+
+
+def is_pause_phrase(text: str) -> bool:
+    from .ears import normalize
+    n = normalize(text)
+    for filler in ("jarvis ", "ok ", "okay ", "no ", "please "):
+        n = n.removeprefix(filler)
+    n = n.removesuffix(" please").removesuffix(" jarvis").strip()
+    return n in PAUSE_PHRASES or any(n == f"{p} {p}" for p in PAUSE_PHRASES)
+
+
 def extract_wake(text: str) -> tuple[str | None, bool]:
     """(prompt, woke): woke if the wake phrase is present; prompt is what follows it."""
     m = WAKE_RE.search(text)
@@ -57,7 +72,7 @@ def is_sleep_phrase(text: str) -> bool:
 
 def cmd_talk(args, cfg) -> int:
     from .brain import Brain
-    from .ears import Listener, Transcriber, is_noise, normalize
+    from .ears import BargeIn, Listener, Transcriber, is_noise, normalize
     from .voice import chime, describe, make_speaker
 
     if not shutil.which("claude"):
@@ -90,6 +105,31 @@ def cmd_talk(args, cfg) -> int:
         if listener:
             listener.flush()
 
+    def on_barge_in():
+        brain.cancel()
+        speaker.stop()
+
+    barge_on = cfg["barge_in"] if args.barge_in is None else args.barge_in
+    barge = BargeIn(listener, speaker, on_barge_in) if listener and barge_on else None
+
+    def respond(prompt: str) -> list | None:
+        """Ask Claude and speak the reply. Returns the start of the user's speech if
+        they talked over Jarvis (it then stops at once), otherwise None."""
+        if not barge:
+            brain.ask(prompt, speaker)
+            finish_speaking()
+            return None
+        with barge.watch():
+            brain.ask(prompt, speaker)
+            if not barge.triggered:
+                speaker.wait()
+        if not barge.triggered:
+            listener.flush()
+            return None
+        speaker.stop()  # in case a sentence slipped in while Claude was being stopped
+        print(f"\n{C_YEL}[you spoke: Jarvis paused to listen]{C_RST}")
+        return barge.captured
+
     if listener:
         listener.start_continuous()
     finish_speaking()
@@ -103,17 +143,22 @@ def cmd_talk(args, cfg) -> int:
     if wake:
         standby_notice()
     last_interrupt = 0.0
+    barged: list | None = None  # start of speech that interrupted Jarvis
     while True:
         try:
             # ---- get the user's words
+            interrupted = barged is not None
             if args.type:
                 text = input(f"{C_GRN}You:{C_RST} ").strip()
             else:
-                if active:
-                    chime("Tink", cfg, wait=True)
-                    listener.flush()
-                print(f"{C_DIM}{'listening...' if active else 'standing by...'}{C_RST}", end="\r", flush=True)
-                audio = listener.listen(start_timeout=timeout if (wake and active) else None)
+                if interrupted:  # they're mid-sentence: no chime, no flush, keep recording
+                    audio, barged = listener.listen(prefix=barged), None
+                else:
+                    if active:
+                        chime("Tink", cfg, wait=True)
+                        listener.flush()
+                    print(f"{C_DIM}{'listening...' if active else 'standing by...'}{C_RST}", end="\r", flush=True)
+                    audio = listener.listen(start_timeout=timeout if (wake and active) else None)
                 if audio is None:
                     if listener.timed_out:  # silence: back to standby
                         active = False
@@ -150,6 +195,9 @@ def cmd_talk(args, cfg) -> int:
                         finish_speaking()
                         continue
                     prompt = woken_prompt
+            if interrupted and is_pause_phrase(prompt):
+                continue  # "wait" / "stop": stay quiet and listen again
+            if wake:
                 if is_sleep_phrase(prompt):
                     speaker.say(f"Very good, {address}. Standing by.")
                     finish_speaking()
@@ -170,13 +218,13 @@ def cmd_talk(args, cfg) -> int:
 
             if not args.type:
                 chime("Pop", cfg)
-            brain.ask(prompt, speaker)
-            finish_speaking()
+            barged = respond(INTERRUPT_NOTE + prompt if interrupted else prompt)
         except KeyboardInterrupt:
             now = time.time()
             busy = speaker.busy.is_set() or brain.proc is not None
             brain.cancel()
             speaker.stop()
+            barged = None
             if listener:
                 listener.flush()
             if not busy and now - last_interrupt < 1.5:
@@ -218,6 +266,19 @@ def cmd_listen(args, cfg) -> int:
     return 0
 
 
+def cmd_converse(args, cfg) -> int:
+    """Start (or end) hands-free conversation in Claude Code (used by /jarvis:talk)."""
+    from . import converse
+    if args.end:
+        converse.end()
+        print("Voice conversation ended.")
+        return 0
+    converse.start()
+    if cmd_listen(args, cfg):  # nothing heard: don't leave the session armed
+        converse.end()
+    return 0
+
+
 def cmd_say(args, cfg) -> int:
     from .voice import make_speaker, split_sentences
 
@@ -231,6 +292,10 @@ def cmd_say(args, cfg) -> int:
     else:
         text = sys.stdin.read()
     cfg = {**cfg, **{k: v for k, v in voice_overrides(args).items() if v is not None}}
+    if args.listen:
+        from .converse import speak_listening
+        speak_listening(cfg, text)
+        return 0
     speaker = make_speaker(cfg)
     for s in split_sentences(text):
         speaker.say(s)
@@ -300,7 +365,9 @@ def cmd_toggle(on: bool):
         cfg["speak_replies"] = on
         config.save(cfg)
         if not on:
+            from .converse import end
             hush()
+            end()
         print(f"Jarvis voice replies in Claude Code: {'ON' if on else 'OFF'}")
         return 0
     return run
@@ -389,6 +456,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="wait for 'Hey Jarvis' (default; see `jarvis config set wake`)")
     p.add_argument("--always", dest="wake", action="store_false", help="always listening, no wake word")
     p.add_argument("--wake-timeout", type=float, help="seconds of silence before standby (default 10)")
+    p.add_argument("--no-barge-in", dest="barge_in", action="store_false", default=None,
+                   help="don't stop speaking when you talk over Jarvis")
     p.add_argument("--type", action="store_true", help="type prompts, hear replies")
     p.add_argument("--model", help="Claude model, e.g. sonnet, opus, haiku")
     p.add_argument("--cwd", help="directory Claude works in (default: current)")
@@ -402,10 +471,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-seconds", type=float, default=60.0)
     p.set_defaults(func=cmd_listen)
 
+    p = sub.add_parser("converse", help="hands-free conversation inside Claude Code (/jarvis:talk)")
+    p.add_argument("--end", action="store_true", help="end the conversation")
+    p.add_argument("--timeout", type=float, default=15.0, help="seconds to wait for the first words")
+    p.add_argument("--max-seconds", type=float, default=60.0)
+    p.set_defaults(func=cmd_converse)
+
     p = voice_opts(sub.add_parser("say", help="speak text (args, --file, or stdin)"))
     p.add_argument("text", nargs="*")
     p.add_argument("--file")
     p.add_argument("--delete", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--listen", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_say)
 
     sub.add_parser("hush", help="stop speaking").set_defaults(func=cmd_hush)
@@ -430,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_samples)
 
     p = sub.add_parser("hook", help=argparse.SUPPRESS)
-    p.add_argument("event", choices=["stop", "prompt"])
+    p.add_argument("event", choices=["stop", "prompt", "tool", "tool-done"])
     p.set_defaults(func=cmd_hook)
     return ap
 

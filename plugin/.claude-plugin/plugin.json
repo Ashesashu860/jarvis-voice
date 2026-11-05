@@ -1,6 +1,6 @@
 {
   "name": "jarvis",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Speak prompts with /jarvis:listen and hear Claude's replies in a refined, JARVIS-style British AI voice. Requires the `jarvis` command (pipx/uv install jarvis-voice).",
   "author": { "name": "Ashesashu860" },
   "homepage": "https://github.com/Ashesashu860/jarvis-voice",

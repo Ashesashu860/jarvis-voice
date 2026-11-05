@@ -56,12 +56,21 @@ Restart Claude Code if the commands don't appear straight away.
 
 | Command | What it does |
 |---|---|
+| `/jarvis:talk` | Hands-free conversation in the session: speak, hear the reply, then just answer. You can talk over Jarvis to interrupt. Ends after a minute of silence (`converse_timeout`) or "that's all"; then you're back to typing. |
 | `/jarvis:listen` | Speak your prompt. A *tink* means it's listening and a *pop* means it heard you. It stops after a second of silence. |
 | `/jarvis:on` / `/jarvis:off` | Turn spoken replies on or off |
 | `/jarvis:hush` | Stop the current speech (sending any new prompt also stops it) |
 
 With the plugin installed, every finished reply is read aloud: its opening prose, up to about 600 characters,
 skipping code blocks and tables. The rest stays on screen.
+
+While Claude works, Jarvis also reads out progress: Claude's short updates between steps ("Tests written; now
+running them.") and, at most every twelve seconds, what it's doing ("Editing cli.py."). Turn this off with
+`jarvis config set narrate false`.
+
+During a `/jarvis:talk` conversation the mic stays open while Jarvis reads those updates: talk over it and it
+stops, catches what you say ("Noted, sir.") and passes it to Claude after its current step, so you can steer
+a task mid-flight. "Stop" or "wait" just quiets it.
 
 ### Hands-free conversation
 
@@ -82,7 +91,12 @@ How the wake word works:
    "that's all", "stand by" or "thank you, Jarvis".
 
 Say "new conversation" to clear context, or "goodbye" to quit. Ctrl+C interrupts.
-Jarvis doesn't hear itself: audio picked up while it speaks is thrown away, so wait for the *tink* before replying.
+
+**Talk over Jarvis to interrupt it.** If you start speaking while it's answering, it stops mid-sentence,
+cancels the rest of the reply and listens to you. "Stop", "wait" or "hold on" just quiets it and it
+listens again; anything else is taken as your next request. Jarvis learns how loud its own voice is in your
+mic so it doesn't interrupt itself. It works best with headphones; on laptop speakers keep the volume
+moderate. Turn it off with `--no-barge-in` or `jarvis config set barge_in false`.
 By default Claude may read files and search the web without asking. Add `--permission-mode acceptEdits` to let it edit files too.
 
 ### Other commands
@@ -115,6 +129,7 @@ Stored in `~/.config/jarvis-voice/config.json`. Change them with `jarvis config 
 | `whisper` | `base.en` | Speech model: `tiny.en` (fastest) … `small.en` (more accurate) |
 | `silence` | `1.0` | Seconds of silence that end your turn |
 | `sensitivity` | `3.0` | Mic threshold over background noise. Lower is more sensitive |
+| `barge_in` | `true` | `jarvis talk`: speaking over Jarvis stops it and it listens |
 | `chimes` | `true` | Listening and heard sounds |
 
 ## How the voice is made

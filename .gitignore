@@ -9,3 +9,4 @@ jarvis-samples/
 *.wav
 *.onnx
 *.bin
+.claude/settings.local.json

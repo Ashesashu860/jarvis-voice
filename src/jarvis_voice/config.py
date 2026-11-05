@@ -26,8 +26,11 @@ DEFAULTS: dict = {
     "whisper": "base.en",
     "silence": 1.0,
     "sensitivity": 3.0,
+    "converse_timeout": 60.0,      # /jarvis:talk: seconds of silence before the conversation ends
+    "barge_in": True,             # jarvis talk: talking over Jarvis stops it and it listens
     # Claude Code integration
     "speak_replies": True,         # read Claude Code replies aloud (Stop hook)
+    "narrate": True,               # speak progress updates while Claude works (PreToolUse hook)
     "persona_in_claude_code": True,  # give Claude Code the Jarvis manner while voice is on
     "max_spoken_chars": 600,       # longer replies are cut at a sentence; the rest stays on screen
 }

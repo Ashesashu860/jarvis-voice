@@ -2,6 +2,7 @@
 Claude Code for long, and always exits 0 so a voice problem can't break a session."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 from . import config
 from .brain import claude_code_note
@@ -41,14 +43,18 @@ def hush() -> None:
         pass
 
 
-def speak_detached(text: str) -> None:
-    """Speak `text` in a background process so the hook returns immediately."""
+def speak_detached(text: str, listen: bool = False) -> None:
+    """Speak `text` in a background process so the hook returns immediately.
+    With `listen`, it also hears the user talking over it (see converse.speak_listening)."""
     hush()
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     fd, path = tempfile.mkstemp(prefix="say-", suffix=".txt", dir=config.CACHE_DIR)
     with os.fdopen(fd, "w") as f:
         f.write(text)
-    proc = subprocess.Popen([sys.executable, "-m", "jarvis_voice", "say", "--file", path, "--delete"],
+    cmd = [sys.executable, "-m", "jarvis_voice", "say", "--file", path, "--delete"]
+    if listen:
+        cmd.append("--listen")
+    proc = subprocess.Popen(cmd,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
     config.PID_FILE.write_text(str(proc.pid))
@@ -110,32 +116,155 @@ def spoken_excerpt(reply: str, max_chars: int) -> str:
 
 # ----------------------------------------------------------------------------- hook entry points
 def on_stop() -> None:
+    from . import converse
+
     data = _read_input()
     cfg = config.load()
-    if not _active(cfg):
+    if os.environ.get("JARVIS_VOICE_CHILD"):
+        return
+    conversing = converse.claim(data.get("session_id"))
+    if not (conversing or cfg["speak_replies"]):
         return
     reply = data.get("last_assistant_message") or ""
     if not reply and data.get("transcript_path"):
         reply = last_reply_from_transcript(data["transcript_path"])
     text = spoken_excerpt(reply, cfg["max_spoken_chars"])
-    if text:
-        speak_detached(text)
+    if not conversing:
+        if text:
+            speak_detached(text)
+        return
+    # Conversation mode: speak, listen, and hand the user's reply straight back to Claude.
+    converse.wait_for_capture()  # let a progress update finish catching what they said
+    hush()
+    pending = converse.pop_all()
+    if pending:  # they spoke over a progress update and Claude hasn't seen it yet
+        print(json.dumps({"decision": "block",
+                          "reason": converse.continuation(" ".join(pending), cfg["address"])}))
+        return
+    heard = converse.turn(cfg, text)
+    if heard is None:
+        converse.end()
+        return
+    print(json.dumps({"decision": "block", "reason": converse.continuation(heard, cfg["address"])}))
 
 
 def on_prompt() -> None:
     _read_input()
     hush()  # you started talking: Jarvis stops
     cfg = config.load()
-    if _active(cfg) and cfg["persona_in_claude_code"]:
+    from .converse import is_on
+    voiced = _active(cfg) or (is_on() and not os.environ.get("JARVIS_VOICE_CHILD"))
+    if voiced and cfg["persona_in_claude_code"]:
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": claude_code_note(cfg["address"]),
         }}))
 
 
+# ----------------------------------------------------------------------------- progress narration
+NARRATE_FILE = config.CACHE_DIR / "narrate.json"
+TOOL_GAP_S = 12.0  # at most one "Editing cli.py"-style update this often
+
+
+def _base(path) -> str:
+    return os.path.basename(str(path or "")).replace("_", " ") or "a file"
+
+
+def describe_tool(name: str, inp: dict) -> str | None:
+    """A short spoken line for what a tool call is doing, or None to stay quiet."""
+    inp = inp or {}
+    if name == "Bash":
+        desc = (inp.get("description") or "").strip().rstrip(".")
+        return f"{desc}." if desc else "Running a command."
+    if name in ("Edit", "MultiEdit", "NotebookEdit"):
+        return f"Editing {_base(inp.get('file_path') or inp.get('notebook_path'))}."
+    if name == "Write":
+        return f"Writing {_base(inp.get('file_path'))}."
+    if name == "Read":
+        return f"Reading {_base(inp.get('file_path'))}."
+    if name in ("Grep", "Glob"):
+        return "Searching the code."
+    if name in ("WebSearch", "WebFetch"):
+        return "Looking it up online."
+    if name in ("Agent", "Task"):
+        desc = (inp.get("description") or "").strip().rstrip(".")
+        return f"Delegating: {desc}." if desc else "Handing part of this to a helper."
+    return None
+
+
+def _speaking() -> bool:
+    """Is a detached `jarvis say` still talking? (Tool updates never cut it off.)"""
+    try:
+        os.kill(int(config.PID_FILE.read_text().strip()), 0)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+
+
+def _narrate_state() -> dict:
+    try:
+        return json.loads(NARRATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def on_tool() -> None:
+    """PreToolUse: say what Claude is doing. New narration from Claude ("Now I'll fix
+    the tests") is always spoken; otherwise a brief description of the tool, rate-limited."""
+    from . import converse
+
+    data = _read_input()
+    cfg = config.load()
+    if os.environ.get("JARVIS_VOICE_CHILD") or not cfg["narrate"]:
+        return
+    conversing = converse.claim(data.get("session_id"))
+    if not (cfg["speak_replies"] or conversing):
+        return
+    if converse.capturing():  # the user is talking to us: don't speak over them
+        return
+    st = _narrate_state()
+    session = data.get("session_id")
+    if st.get("session") != session:
+        st = {"session": session}
+    now = time.time()
+
+    line = None
+    note = last_reply_from_transcript(data["transcript_path"]) if data.get("transcript_path") else ""
+    note = spoken_excerpt(note, 220) if note else ""
+    key = hashlib.sha1(note.encode()).hexdigest() if note else None
+    if note and key != st.get("note"):
+        line, st["note"] = note, key
+    elif now - st.get("tool_at", 0) >= TOOL_GAP_S and not _speaking():
+        line = describe_tool(data.get("tool_name", ""), data.get("tool_input") or {})
+    if not line:
+        return
+    st["tool_at"] = now
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    NARRATE_FILE.write_text(json.dumps(st))
+    # In a conversation, keep the mic open while speaking so the user can cut in.
+    speak_detached(line, listen=conversing)
+
+
+def on_tool_done() -> None:
+    """PostToolUse: pass anything the user said over a progress update on to Claude."""
+    from . import converse
+
+    data = _read_input()
+    if os.environ.get("JARVIS_VOICE_CHILD") or not converse.claim(data.get("session_id")):
+        return
+    pending = converse.pop_all()
+    if pending:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": converse.interjection(pending, config.load()["address"]),
+        }}))
+
+
 def run(event: str) -> int:
     try:
-        {"stop": on_stop, "prompt": on_prompt}[event]()
+        {"stop": on_stop, "prompt": on_prompt, "tool": on_tool, "tool-done": on_tool_done}[event]()
     except Exception as e:  # never break the user's Claude Code session
         print(f"jarvis hook {event}: {type(e).__name__}: {e}", file=sys.stderr)
     return 0

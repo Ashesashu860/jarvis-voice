@@ -134,8 +134,30 @@ class SaySpeaker:
             self.proc.terminate()
         self.busy.clear()
 
+    def output_level(self, t: float) -> float | None:
+        return None  # unknown: `say` plays the audio itself
+
 
 # ----------------------------------------------------------------------------- processed neural voices
+ENV_HOP_S = 0.01            # resolution of the playback loudness envelope
+ECHO_WINDOW = (0.3, 0.05)   # mic frame at t may hold echo of audio played in [t-0.3, t+0.05]
+
+
+def loudness_envelope(audio: np.ndarray, hop_s: float = ENV_HOP_S) -> np.ndarray:
+    mono = audio.mean(axis=1) if audio.ndim == 2 else audio
+    hop = max(1, int(SR * hop_s))
+    n = len(mono) // hop
+    if n == 0:
+        return np.zeros(1, np.float32)
+    return np.sqrt((mono[: n * hop].reshape(n, hop) ** 2).mean(axis=1)).astype(np.float32)
+
+
+def level_at(ref, t: float) -> float:
+    """Loudest playback level that could be echoing in the mic at monotonic time t."""
+    start, env = ref
+    i0 = max(0, int((t - ECHO_WINDOW[0] - start) / ENV_HOP_S))
+    i1 = min(len(env), int((t + ECHO_WINDOW[1] - start) / ENV_HOP_S) + 1)
+    return float(env[i0:i1].max()) if i1 > i0 else 0.0
 class ProcessedSpeaker:
     """Base for neural voices. Pipeline: text queue -> synth thread (prepares the
     next sentence while the current one plays) -> audio queue -> player thread."""
@@ -149,6 +171,7 @@ class ProcessedSpeaker:
         self.lock = threading.Lock()
         self.generation = 0
         self.busy = threading.Event()
+        self.playing = None  # (monotonic start, loudness envelope), or "fallback"
         self.ir = _impulse_response()
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
@@ -188,6 +211,13 @@ class ProcessedSpeaker:
         if self.fallback:
             self.fallback.stop()
 
+    def output_level(self, t: float) -> float | None:
+        """How loud the audio playing around monotonic time t is (None if unknown)."""
+        ref = self.playing
+        if ref == "fallback":
+            return None
+        return 0.0 if ref is None else level_at(ref, t)
+
     # -- internals
     def _done_one(self):
         with self.lock:
@@ -213,9 +243,12 @@ class ProcessedSpeaker:
                 continue
             if audio is None:
                 if self.fallback:
+                    self.playing = "fallback"
                     self.fallback.say(text)
                     self.fallback.wait()
             else:
+                env = loudness_envelope(audio)
+                self.playing = (time.monotonic(), env)
                 self.sd.play(audio, SR)
                 self.sd.wait()
             if gen == self.generation:
