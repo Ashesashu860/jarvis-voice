@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jarvis-voice"
+version = "0.1.0"
+description = "Talk to Claude Code and hear it answer in a refined, JARVIS-style British AI voice."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Ashesashu860" }]
+keywords = ["claude", "claude-code", "voice", "assistant", "tts", "speech-recognition", "jarvis"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "sounddevice>=0.4.6",
+  "faster-whisper>=1.0",
+  "kokoro-onnx>=0.4",
+]
+
+[project.optional-dependencies]
+online = ["edge-tts>=6.1"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+jarvis = "jarvis_voice.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Ashesashu860/jarvis-voice"
+Issues = "https://github.com/Ashesashu860/jarvis-voice/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jarvis_voice"]

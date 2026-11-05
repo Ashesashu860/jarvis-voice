@@ -1,0 +1,17 @@
+{
+  "name": "jarvis-voice",
+  "owner": { "name": "Ashesashu860" },
+  "metadata": {
+    "description": "A JARVIS-style voice for Claude Code: speak your prompts, hear the replies."
+  },
+  "plugins": [
+    {
+      "name": "jarvis",
+      "source": "./plugin",
+      "description": "Speak prompts with /jarvis:listen and hear Claude's replies in a refined British AI voice.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["voice", "speech", "tts", "accessibility"]
+    }
+  ]
+}

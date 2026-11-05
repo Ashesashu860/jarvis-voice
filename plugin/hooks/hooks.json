@@ -1,0 +1,19 @@
+{
+  "description": "Read Claude's replies aloud in the Jarvis voice; stop talking when you send a new prompt.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "command -v jarvis >/dev/null 2>&1 && jarvis hook prompt || true", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "command -v jarvis >/dev/null 2>&1 && jarvis hook stop || true", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
