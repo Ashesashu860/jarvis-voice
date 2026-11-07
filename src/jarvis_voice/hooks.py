@@ -14,7 +14,7 @@ import time
 
 from . import config
 from .brain import claude_code_note
-from .voice import clean_for_speech, split_sentences
+from .text import clean_for_speech, split_sentences
 
 
 def _read_input() -> dict:
@@ -30,12 +30,36 @@ def _active(cfg: dict) -> bool:
 
 
 # ----------------------------------------------------------------------------- speaking process control
-def hush() -> None:
-    """Stop whatever Jarvis is currently saying."""
+# Plain replies and updates go to the speech daemon (fast, session-aware). Updates spoken
+# during a /jarvis:talk conversation also listen for the user, so they run in their own
+# process, tracked by PID_FILE as {"pid": ..., "session": ...}.
+NARRATION_TTL_S = 15.0  # a progress update that can't start this soon is dropped
+
+
+def _speaker_proc() -> tuple[int | None, str | None]:
     try:
-        pid = int(config.PID_FILE.read_text().strip())
+        raw = config.PID_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None, None
+    try:
+        st = json.loads(raw)
+        if isinstance(st, int):
+            return st, None
+        return int(st["pid"]), st.get("session")
+    except (ValueError, KeyError, TypeError):
+        return None, None
+
+
+def hush(session: str | None = None) -> None:
+    """Stop what Jarvis is saying: for one Claude Code session, or (None) everywhere."""
+    from . import daemon
+    daemon.request("hush", session=session)
+    pid, owner = _speaker_proc()
+    if pid is None or (session is not None and owner not in (None, session)):
+        return
+    try:
         os.killpg(pid, signal.SIGTERM)
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError):
         pass
     try:
         config.PID_FILE.unlink()
@@ -43,10 +67,18 @@ def hush() -> None:
         pass
 
 
-def speak_detached(text: str, listen: bool = False) -> None:
-    """Speak `text` in a background process so the hook returns immediately.
-    With `listen`, it also hears the user talking over it (see converse.speak_listening)."""
-    hush()
+def speak_detached(text: str, listen: bool = False, session: str | None = None,
+                   ttl: float | None = None) -> None:
+    """Speak `text` without blocking the hook. With `listen`, it also hears the user
+    talking over it (see converse.speak_listening)."""
+    if not listen and config.load()["speech_daemon"]:
+        from . import daemon
+        pid, owner = _speaker_proc()
+        if pid is not None and owner in (None, session):
+            hush(session)  # a listening update from this session is still going
+        daemon.speak(text, session=session, ttl=ttl)
+        return
+    hush(session)
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     fd, path = tempfile.mkstemp(prefix="say-", suffix=".txt", dir=config.CACHE_DIR)
     with os.fdopen(fd, "w") as f:
@@ -57,7 +89,7 @@ def speak_detached(text: str, listen: bool = False) -> None:
     proc = subprocess.Popen(cmd,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
-    config.PID_FILE.write_text(str(proc.pid))
+    config.PID_FILE.write_text(json.dumps({"pid": proc.pid, "session": session}))
 
 
 # ----------------------------------------------------------------------------- reply extraction
@@ -131,7 +163,7 @@ def on_stop() -> None:
     text = spoken_excerpt(reply, cfg["max_spoken_chars"])
     if not conversing:
         if text:
-            speak_detached(text)
+            speak_detached(text, session=data.get("session_id"))
         return
     # Conversation mode: speak, listen, and hand the user's reply straight back to Claude.
     converse.wait_for_capture()  # let a progress update finish catching what they said
@@ -149,8 +181,8 @@ def on_stop() -> None:
 
 
 def on_prompt() -> None:
-    _read_input()
-    hush()  # you started talking: Jarvis stops
+    data = _read_input()
+    hush(data.get("session_id"))  # you started typing here: this session's Jarvis stops
     cfg = config.load()
     from .converse import is_on
     voiced = _active(cfg) or (is_on() and not os.environ.get("JARVIS_VOICE_CHILD"))
@@ -193,21 +225,33 @@ def describe_tool(name: str, inp: dict) -> str | None:
 
 
 def _speaking() -> bool:
-    """Is a detached `jarvis say` still talking? (Tool updates never cut it off.)"""
-    try:
-        os.kill(int(config.PID_FILE.read_text().strip()), 0)
+    """Is Jarvis talking in any session? (Tool updates never cut it off.)"""
+    from . import daemon
+    st = daemon.request("status")
+    if st and (st.get("busy") or st.get("queued")):
         return True
-    except (FileNotFoundError, ValueError, ProcessLookupError):
+    pid, _ = _speaker_proc()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
         return False
     except PermissionError:
         return True
 
 
-def _narrate_state() -> dict:
+def _narrate_states() -> dict:
+    """Per-session narration state: {session_id: {"note": ..., "tool_at": ...}}."""
     try:
-        return json.loads(NARRATE_FILE.read_text())
+        st = json.loads(NARRATE_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    if not isinstance(st, dict) or "session" in st:  # old single-session format
+        return {}
+    cutoff = time.time() - 6 * 3600
+    return {k: v for k, v in st.items() if isinstance(v, dict) and v.get("seen", 0) > cutoff}
 
 
 def on_tool() -> None:
@@ -224,10 +268,9 @@ def on_tool() -> None:
         return
     if converse.capturing():  # the user is talking to us: don't speak over them
         return
-    st = _narrate_state()
+    states = _narrate_states()
     session = data.get("session_id")
-    if st.get("session") != session:
-        st = {"session": session}
+    st = states.setdefault(str(session), {})
     now = time.time()
 
     line = None
@@ -240,11 +283,11 @@ def on_tool() -> None:
         line = describe_tool(data.get("tool_name", ""), data.get("tool_input") or {})
     if not line:
         return
-    st["tool_at"] = now
+    st["tool_at"] = st["seen"] = now
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    NARRATE_FILE.write_text(json.dumps(st))
+    NARRATE_FILE.write_text(json.dumps(states))
     # In a conversation, keep the mic open while speaking so the user can cut in.
-    speak_detached(line, listen=conversing)
+    speak_detached(line, listen=conversing, session=session, ttl=None if conversing else NARRATION_TTL_S)
 
 
 def on_tool_done() -> None:

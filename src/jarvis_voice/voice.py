@@ -15,9 +15,9 @@ import urllib.request
 import numpy as np
 
 from . import config
+from .text import clean_for_speech, split_sentences  # noqa: F401  (re-exported)
 
 SR = 24000
-SENTENCE_END = re.compile(r"(?<!\b(?:Mr|Ms|Dr|St|vs))[.!?;:]\s+|\n+")
 
 KOKORO_FILES = {
     "kokoro-v1.0.onnx": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx",
@@ -32,26 +32,6 @@ MAC_VOICE_PREFERENCE = [
 
 def log(msg: str) -> None:
     print(f"\033[2m{msg}\033[0m", file=sys.stderr, flush=True)
-
-
-# ----------------------------------------------------------------------------- text helpers
-def clean_for_speech(text: str) -> str:
-    text = re.sub(r"```.*?```", " ", text, flags=re.S)          # drop code blocks
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)         # [label](url) -> label
-    text = re.sub(r"https?://\S+", "a link", text)
-    text = re.sub(r"[`*_#>|~]", "", text)
-    text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def split_sentences(text: str) -> list[str]:
-    out, buf = [], text
-    while (m := SENTENCE_END.search(buf)):
-        out.append(buf[: m.end()])
-        buf = buf[m.end():]
-    if buf.strip():
-        out.append(buf)
-    return [s for s in out if s.strip()]
 
 
 # ----------------------------------------------------------------------------- models

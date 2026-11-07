@@ -202,3 +202,138 @@ def test_stop_hook_blocks_with_spoken_reply(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(converse, "turn", lambda cfg, text: None)  # silence ends it
     hooks.on_stop()
     assert capsys.readouterr().out == "" and not converse.is_on()
+
+
+# ----------------------------------------------------------------------------- spoken text
+import pytest  # noqa: E402
+
+@pytest.mark.parametrize("raw, spoken", [
+    ("I edited `speak_detached` in src/jarvis_voice/hooks.py:42.", "I edited speak detached in hooks dot py, line 42."),
+    ("Released v0.3.0 at ~60 ms, 400 MB, 10s.",
+     "Released version 0 point 3 point 0 at about 60 milliseconds, 400 megabytes, 10 seconds."),
+    ("Run /jarvis:talk, e.g. now → done.", "Run jarvis talk, for example now to done."),
+    ("Fixed parseConfig 🎉 & config.json", "Fixed parse Config and config dot json"),
+    ("Use read/write, a 50/50 split, in the 1990s; version 3.5 is out.",
+     "Use read/write, a 50/50 split, in the 1990s; version 3.5 is out."),
+    ("See ~/.cache/jarvis-voice/models", "See models"),
+    ("1 s later, took 0.78s.", "1 second later, took 0.78 seconds."),
+    ("On macOS and iPhone via GitHub ✅", "On macOS and iPhone via GitHub"),
+    ("1. First\n2) Second", "First Second"),
+])
+def test_clean_for_speech_reads_code_naturally(raw, spoken):
+    assert clean_for_speech(raw) == spoken
+
+
+def test_hooks_do_not_import_numpy():
+    import subprocess, sys
+    code = "import sys, jarvis_voice.hooks; print('numpy' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True).stdout.strip()
+    assert out == "False"
+
+
+# ----------------------------------------------------------------------------- speech daemon
+import time as _time  # noqa: E402
+
+from jarvis_voice import daemon  # noqa: E402
+
+
+class FakeSpeaker:
+    """Records what it was asked to say; 'plays' until released or stopped."""
+
+    def __init__(self):
+        self.said, self.release = [], threading.Event()
+        self.busy = threading.Event()
+
+    def say(self, text):
+        self.said.append(text)
+        self.busy.set()
+
+    def wait(self):
+        while self.busy.is_set() and not self.release.wait(0.01):
+            pass
+        self.busy.clear()
+
+    def stop(self):
+        self.busy.clear()
+
+
+def _daemon_with(fake):
+    d = daemon.SpeechDaemon(idle_s=60)
+    d._ensure_speaker = lambda idle_for: setattr(d, "speaker", fake)
+    threading.Thread(target=d.worker, daemon=True).start()
+    return d
+
+
+def _until(cond, limit=2.0):
+    end = _time.time() + limit
+    while not cond() and _time.time() < end:
+        _time.sleep(0.01)
+    return cond()
+
+
+def test_daemon_same_session_replaces_other_session_waits():
+    fake = FakeSpeaker()
+    d = _daemon_with(fake)
+    d.say("Reply from A.", "A", None)
+    assert _until(lambda: fake.said == ["Reply from A."])
+    d.say("Reply from B.", "B", None)       # another session: waits its turn
+    _time.sleep(0.05)
+    assert fake.said == ["Reply from A."] and d.status()["queued"] == 1
+    d.say("Newer reply from A.", "A", None)  # same session: cuts A off; joins the back of the line
+    assert _until(lambda: d.status()["session"] == "B")
+    fake.release.set()
+    assert _until(lambda: fake.said == ["Reply from A.", "Reply from B.", "Newer reply from A."])
+    assert _until(lambda: not d.status()["busy"])
+    d.stop()
+
+
+def test_daemon_hush_is_per_session_and_stale_updates_drop():
+    fake = FakeSpeaker()
+    d = _daemon_with(fake)
+    d.say("A talks.", "A", None)
+    assert _until(lambda: fake.said == ["A talks."])
+    d.say("B waits.", "B", None)
+    d.say("Old progress.", "C", 0.01)  # ttl: dropped if it can't start in time
+    _time.sleep(0.05)
+    d.hush("B")
+    assert d.status()["session"] == "A"  # hushing B leaves A talking
+    d.hush("A")
+    assert _until(lambda: not d.status()["busy"])
+    assert fake.said == ["A talks."]
+    d.stop()
+
+
+def test_daemon_socket_roundtrip(monkeypatch):
+    import tempfile as tf
+    tmp = tf.mkdtemp(prefix="jv")  # short path: Unix socket paths are limited to ~104 chars
+    from pathlib import Path
+    monkeypatch.setattr(daemon, "SOCK", Path(tmp) / "s.sock")
+    monkeypatch.setattr(daemon, "LOCK", Path(tmp) / "s.lock")
+    monkeypatch.setattr(config, "CACHE_DIR", Path(tmp))
+    monkeypatch.setattr(config, "load", lambda: {**config.DEFAULTS})
+    fake = FakeSpeaker()
+    monkeypatch.setattr(daemon.SpeechDaemon, "_ensure_speaker",
+                        lambda self, idle_for: setattr(self, "speaker", fake))
+    assert daemon.request("status") is None
+    t = threading.Thread(target=daemon.serve, daemon=True)
+    t.start()
+    assert _until(lambda: daemon.request("status") is not None)
+    assert daemon.request("say", text="Hello there.", session="A", ttl=None)["ok"]
+    assert _until(lambda: fake.said == ["Hello there."])
+    assert daemon.request("status")["session"] == "A"
+    assert daemon.request("hush", session=None)["ok"]
+    assert daemon.request("quit")["ok"]
+    t.join(3)
+    assert not t.is_alive() and not daemon.SOCK.exists()
+
+
+def test_hush_leaves_other_sessions_listening_process(tmp_path, monkeypatch):
+    killed = []
+    monkeypatch.setattr(config, "PID_FILE", tmp_path / "speaking.pid")
+    monkeypatch.setattr(daemon, "request", lambda *a, **k: None)
+    monkeypatch.setattr(hooks.os, "killpg", lambda pid, sig: killed.append(pid))
+    config.PID_FILE.write_text(json.dumps({"pid": 4242, "session": "A"}))
+    hooks.hush("B")
+    assert killed == [] and config.PID_FILE.exists()
+    hooks.hush("A")
+    assert killed == [4242] and not config.PID_FILE.exists()

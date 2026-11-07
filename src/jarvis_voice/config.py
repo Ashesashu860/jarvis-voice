@@ -33,6 +33,8 @@ DEFAULTS: dict = {
     "narrate": True,               # speak progress updates while Claude works (PreToolUse hook)
     "persona_in_claude_code": True,  # give Claude Code the Jarvis manner while voice is on
     "max_spoken_chars": 600,       # longer replies are cut at a sentence; the rest stays on screen
+    "speech_daemon": True,         # keep the voice loaded in the background for instant replies
+    "daemon_idle_minutes": 30.0,   # the background voice exits after this long unused (frees ~600 MB)
 }
 
 

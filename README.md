@@ -131,6 +131,10 @@ Stored in `~/.config/jarvis-voice/config.json`. Change them with `jarvis config 
 | `sensitivity` | `3.0` | Mic threshold over background noise. Lower is more sensitive |
 | `barge_in` | `true` | `jarvis talk`: speaking over Jarvis stops it and it listens |
 | `chimes` | `true` | Listening and heard sounds |
+| `narrate` | `true` | Speak progress updates while Claude works |
+| `converse_timeout` | `60` | `/jarvis:talk`: seconds of silence before the conversation ends |
+| `speech_daemon` | `true` | Keep the voice loaded in a background process so replies start in well under a second |
+| `daemon_idle_minutes` | `30` | The background voice exits after this long unused, freeing its ~600 MB |
 
 ## How the voice is made
 
@@ -142,14 +146,27 @@ Stored in `~/.config/jarvis-voice/config.json`. Change them with `jarvis config 
    - a faint stereo shimmer: the upper band, doubled through two slowly drifting 1–2 ms delays
    - a soft high-band exciter that adds subtle "digital" harmonics
    - a tiny bright room, then a soft limiter
-3. Each sentence is generated while the previous one plays, so speech starts in about a second.
+3. Each sentence is generated while the previous one plays. The first reply of a session starts the
+   **speech daemon** (`jarvis daemon`), which keeps the model loaded, so later replies start speaking in under a
+   second instead of about three. It exits after `daemon_idle_minutes` unused, or on `/jarvis:off`.
+
+### What gets said
+
+Replies are tidied up for the ear before they're spoken: `src/app/hooks.py:42` becomes "hooks dot py, line 42",
+`speak_detached` becomes "speak detached", `v0.3.0` "version 0 point 3 point 0", `60 ms` "60 milliseconds",
+`→` "to", `e.g.` "for example", and emoji are skipped rather than read out.
 
 ## How it plugs into Claude Code
 
-- `UserPromptSubmit` hook → `jarvis hook prompt`: stops any current speech, and while voice is on, adds a short
+- `UserPromptSubmit` hook → `jarvis hook prompt`: stops that session's speech, and while voice is on, adds a short
   style note asking Claude to open with a speakable summary in the Jarvis manner.
-- `Stop` hook → `jarvis hook stop`: takes the final reply and speaks its opening in a background process,
+- `Stop` hook → `jarvis hook stop`: takes the final reply and hands its opening to the speech daemon,
   so Claude Code never waits on audio.
+- `PreToolUse` / `PostToolUse` hooks → progress narration, and passing on anything you said mid-task.
+
+**Several Claude Code windows at once?** Each session's speech is tracked separately. Typing in one window only
+silences that window; a reply from another window waits its turn instead of talking over it, and a stale progress
+update is dropped rather than queued. `/jarvis:hush` silences everything.
 - `/jarvis:listen` runs `jarvis listen` and hands the transcript to Claude as your prompt.
 
 The hooks do nothing if `jarvis` isn't installed and always exit cleanly, so a voice problem can't break a session.

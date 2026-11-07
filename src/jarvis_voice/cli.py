@@ -353,6 +353,18 @@ def cmd_hush(args, cfg) -> int:
     return 0
 
 
+def cmd_daemon(args, cfg) -> int:
+    from . import daemon
+    if args.stop:
+        print("Speech daemon stopped." if daemon.request("quit") else "Speech daemon wasn't running.")
+        return 0
+    if args.status:
+        st = daemon.request("status")
+        print(json.dumps(st, indent=2) if st else "Speech daemon not running.")
+        return 0
+    return daemon.serve(args.first)
+
+
 def cmd_hook(args, cfg) -> int:
     from .hooks import run
     return run(args.event)
@@ -365,9 +377,11 @@ def cmd_toggle(on: bool):
         cfg["speak_replies"] = on
         config.save(cfg)
         if not on:
+            from . import daemon
             from .converse import end
             hush()
             end()
+            daemon.request("quit")  # free the voice model's memory
         print(f"Jarvis voice replies in Claude Code: {'ON' if on else 'OFF'}")
         return 0
     return run
@@ -379,6 +393,11 @@ def cmd_status(args, cfg) -> int:
     print(f"  voice replies in Claude Code: {'ON' if cfg['speak_replies'] else 'OFF'}")
     print(f"  voice: {describe(cfg)}")
     print(f"  voice model downloaded: {'yes' if kokoro_ready() else 'no (run: jarvis setup)'}")
+    from . import daemon
+    st = daemon.request("status") if cfg["speech_daemon"] else None
+    print("  speech daemon: " + ("off (speech_daemon = false)" if not cfg["speech_daemon"] else
+                                 f"running (pid {st['pid']}, {'speaking' if st['busy'] else 'idle'})" if st else
+                                 "not running (starts on first reply)"))
     print(f"  config: {config.CONFIG_FILE}")
     print(f"  claude CLI: {shutil.which('claude') or 'not found'}")
     return 0
@@ -504,6 +523,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("samples", help="write voice variant WAVs to compare")
     p.add_argument("dir", nargs="?", default="jarvis-samples")
     p.set_defaults(func=cmd_samples)
+
+    p = sub.add_parser("daemon", help="background voice that makes replies start instantly")
+    p.add_argument("--stop", action="store_true", help="stop the running daemon")
+    p.add_argument("--status", action="store_true", help="show what the daemon is doing")
+    p.add_argument("--first", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_daemon)
 
     p = sub.add_parser("hook", help=argparse.SUPPRESS)
     p.add_argument("event", choices=["stop", "prompt", "tool", "tool-done"])

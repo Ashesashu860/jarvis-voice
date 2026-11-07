@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 
-from .voice import SENTENCE_END
+from .text import SENTENCE_END
 
 C_DIM, C_CYAN, C_YEL, C_RST = "\033[2m", "\033[36m", "\033[33m", "\033[0m"
 
