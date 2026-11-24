@@ -116,6 +116,29 @@ def _lines_backwards(path: str, chunk: int = 1 << 16):
             yield tail.decode("utf-8", "replace")
 
 
+# A Stop hook that blocks (the /jarvis:talk follow-up) is recorded as a hidden "meta" user
+# entry, not a normal prompt. It still starts a new exchange: what came before it is the
+# reply Jarvis has already read out.
+_STOP_FEEDBACK = "Stop hook feedback:"
+
+
+def _is_prompt(entry: dict) -> bool:
+    """Does this transcript entry start a new exchange (a prompt, typed or spoken)?"""
+    if entry.get("type") != "user":
+        return False
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return False
+    if entry.get("isMeta"):
+        return isinstance(content, str) and content.lstrip().startswith(_STOP_FEEDBACK)
+    return True
+
+
+def reply_key(text: str) -> str:
+    """Identifies a reply regardless of whitespace, to avoid saying the same one twice."""
+    return hashlib.sha1(" ".join(text.split()).encode()).hexdigest()
+
+
 def last_reply_from_transcript(path: str) -> str:
     """The latest assistant text written since the user's last real prompt.
 
@@ -131,13 +154,9 @@ def last_reply_from_transcript(path: str) -> str:
                 continue
             kind = entry.get("type")
             msg = entry.get("message") or {}
-            if kind == "user":
-                content = msg.get("content")
-                is_tool_result = isinstance(content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
-                if not is_tool_result and not entry.get("isMeta"):
-                    return ""  # reached the user's prompt: nothing said since
-            elif kind == "assistant":
+            if _is_prompt(entry):
+                return ""  # reached the user's prompt: nothing said since
+            if kind == "assistant":
                 t = _text_of(msg.get("content"))
                 if t.strip():
                     return t  # the final text block is the answer
@@ -180,6 +199,8 @@ def on_stop() -> None:
     if not reply and data.get("transcript_path"):
         reply = last_reply_from_transcript(data["transcript_path"])
     text = spoken_excerpt(reply, cfg["max_spoken_chars"])
+    if reply.strip():
+        _remember_spoken(data.get("session_id"), reply)
     if not conversing:
         if text:
             speak_detached(text, session=data.get("session_id"))
@@ -282,6 +303,15 @@ def _narrate_states() -> dict:
     return {k: v for k, v in st.items() if isinstance(v, dict) and v.get("seen", 0) > cutoff}
 
 
+def _remember_spoken(session: str | None, reply: str) -> None:
+    """Record the reply the Stop hook is reading out, so progress narration in the next
+    turn never reads it a second time."""
+    states = _narrate_states()
+    st = states.setdefault(str(session), {})
+    st["note"], st["seen"] = reply_key(reply), time.time()
+    config.write_json(NARRATE_FILE, states)
+
+
 def on_tool() -> None:
     """PreToolUse: say what Claude is doing. New narration from Claude ("Now I'll fix
     the tests") is always spoken; otherwise a brief description of the tool, rate-limited."""
@@ -316,10 +346,10 @@ def on_tool() -> None:
     now = time.time()
 
     line = None
-    note = last_reply_from_transcript(data["transcript_path"]) if data.get("transcript_path") else ""
-    note = spoken_excerpt(note, 220, mention_code=False) if note else ""
-    key = hashlib.sha1(note.encode()).hexdigest() if note else None
-    if note and key != st.get("note"):
+    raw = last_reply_from_transcript(data["transcript_path"]) if data.get("transcript_path") else ""
+    key = reply_key(raw) if raw.strip() else None
+    note = spoken_excerpt(raw, 220, mention_code=False) if key and key != st.get("note") else ""
+    if note:
         line, st["note"] = note, key
     elif now - st.get("tool_at", 0) >= TOOL_GAP_S and not _speaking():
         line = describe_tool(data.get("tool_name", ""), data.get("tool_input") or {})

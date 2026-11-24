@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Replies are no longer read twice** in `/jarvis:talk`. A spoken follow-up is recorded as a hidden
+  "Stop hook feedback" entry, which progress narration didn't treat as a new prompt, so it re-read the previous
+  reply on the first step of the next turn. Narration also now skips any reply the Stop hook already spoke.
 - **Faster `/jarvis:talk` turns.** Each turn used to load the voice (~2 s) and Whisper (~2 s) from scratch. Turns
   now borrow both from the speech daemon, so Jarvis starts answering in about half a second, and talking over it
   still works (the daemon reports how loud it's playing, so it can tell its own echo from you).

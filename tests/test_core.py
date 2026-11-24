@@ -711,3 +711,45 @@ def test_noise_level_is_remembered_between_turns(tmp_path, monkeypatch):
     assert lst.noise == 0.004 and abs(threshold - 0.012) < 1e-9
     config.write_json(tmp_path / "noise.json", {"noise": 0.004, "at": _time.time() - 3600})
     assert ears._noise_hint() is None  # stale: measure properly
+
+
+def test_spoken_follow_up_is_a_new_exchange(tmp_path):
+    """/jarvis:talk follow-ups arrive as a hidden 'Stop hook feedback' entry. The reply
+    before it was already read out, so it must not be found again (it was spoken twice)."""
+    rows = [
+        {"type": "user", "message": {"content": "/jarvis:talk"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Good evening, sir."}]}},
+        {"type": "user", "isMeta": True,
+         "message": {"content": "Stop hook feedback:\nThe user replied aloud ... \"any lag?\""}},
+        {"type": "attachment", "attachment": {"type": "hook_blocking_error"}},
+        {"type": "system", "subtype": "stop_hook_summary"},
+    ]
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    assert hooks.last_reply_from_transcript(str(p)) == ""
+    # other meta entries (skill text, reminders) still don't count as prompts
+    rows[2] = {"type": "user", "isMeta": True, "message": {"content": "<command-message>x</command-message>"}}
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    assert hooks.last_reply_from_transcript(str(p)) == "Good evening, sir."
+
+
+def test_narration_never_repeats_the_reply_the_stop_hook_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(hooks, "NARRATE_FILE", tmp_path / "narrate.json")
+    monkeypatch.delenv("JARVIS_VOICE_CHILD", raising=False)
+    monkeypatch.setattr(config, "load", lambda: {**config.DEFAULTS})
+    from jarvis_voice import converse
+    monkeypatch.setattr(converse, "claim", lambda s: False)
+    monkeypatch.setattr(converse, "capturing", lambda: False)
+    monkeypatch.setattr(hooks, "_speaking", lambda: True)  # no tool description either
+    spoken = []
+    monkeypatch.setattr(hooks, "speak_detached", lambda text, **kw: spoken.append(text))
+    p = tmp_path / "t.jsonl"
+    reply = {"type": "assistant", "message": {"content": [{"type": "text", "text": "All done,  sir."}]}}
+    p.write_text(json.dumps({"type": "user", "message": {"content": "go"}}) + "\n" + json.dumps(reply))
+    monkeypatch.setattr(hooks, "_read_input", lambda: {"session_id": "s1", "transcript_path": str(p),
+                                                       "last_assistant_message": "All done, sir."})
+    hooks.on_stop()
+    assert spoken == ["All done, sir."]
+    hooks.on_tool()  # a tool call that still finds that reply in the transcript
+    assert spoken == ["All done, sir."]  # not again
