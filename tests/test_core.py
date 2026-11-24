@@ -821,3 +821,24 @@ def test_daemon_logs_time_to_first_audio(capsys):
     assert _until(lambda: err.append(capsys.readouterr().err) or "first audio" in "".join(err))
     assert "spoke for sess-123: first audio" in "".join(err)
     d.stop()
+
+
+def test_turn_timings_are_logged(tmp_path, monkeypatch, capsys):
+    from jarvis_voice import cli, converse
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    converse.mark_asked("s1")
+    assert converse.take_asked("other") is None  # another session's request
+    converse.mark_asked("s1")
+    took = converse.take_asked("s1")
+    assert took is not None and 0 <= took < 5 and converse.take_asked("s1") is None
+    config.timing('you said (1.2s of speech, transcribed in 0.55s): "hello"')
+    config.timing("Claude's reply took 4.2s")
+    monkeypatch.setattr(cli.config, "load", lambda: {**config.DEFAULTS})
+    from jarvis_voice import daemon
+    monkeypatch.setattr(daemon, "LOG", tmp_path / "speechd.log")
+    (tmp_path / "speechd.log").write_text("[00:00:01] spoke for s1: first audio 0.47s after the request\n"
+                                          "[00:00:02] speech daemon 1 up\n")
+    cli.main(["daemon", "--log"])
+    out = capsys.readouterr().out
+    assert 'transcribed in 0.55s): "hello"' in out and "reply took 4.2s" in out
+    assert "first audio 0.47s" in out and "daemon 1 up" not in out

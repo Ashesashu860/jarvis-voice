@@ -148,6 +148,25 @@ def write_json(path: Path, data) -> None:
     write_text_atomic(path, json.dumps(data))
 
 
+def timings_file() -> Path:
+    return CACHE_DIR / "timings.log"
+
+
+def timing(msg: str) -> None:
+    """Append one line to the voice-turn timing log (`jarvis daemon --log`). It stays on
+    this machine, in the private cache folder; it's trimmed once it passes 256 KB."""
+    import time
+    try:
+        path = timings_file()
+        CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 256 << 10:
+            path.write_text("\n".join(path.read_text().splitlines()[-500:]) + "\n")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
 def coerce(key: str, value: str):
     """Parse a CLI string into the type of the default for `key`."""
     if key not in DEFAULTS:

@@ -240,11 +240,14 @@ class SpeechDaemon:
 
     def warm(self, stt: bool = False) -> dict:
         def run():
+            # Only load what isn't loaded. Re-rendering a warm-up line on every turn ran
+            # alongside the real reply and delayed its first words by ~1 s.
             try:
                 with self.voice_lock:
+                    before = self.speaker
                     self._ensure_speaker(0.0)
                     render = getattr(self.speaker, "render", None)
-                    if render:
+                    if render and self.speaker is not before:
                         render("Ready.")  # the first render after loading is ~3x slower
             except Exception as e:  # noqa: BLE001 - report and carry on
                 print(f"warm-up failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)

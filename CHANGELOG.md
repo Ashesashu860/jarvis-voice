@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **First words ~1 s sooner in `/jarvis:talk`.** Every turn asked the daemon to warm up, which re-rendered a
+  warm-up line alongside the real reply (first audio 1.4 s instead of 0.47 s). Warm-up now only loads what
+  isn't loaded.
+- **Turn timing log.** `jarvis daemon --log` shows what you said (and how long transcription took), how long
+  Claude's reply took, how long the Stop hook took to get ready, and the time to Jarvis's first audio.
 - **Snappier voice turns.** Whisper runs on the Apple Silicon GPU when available (`whisper_device auto`; small.en
   0.90 s -> 0.57 s per 4 s clip), the end-of-turn pause is 0.8 s instead of 1.0 s, a long first sentence is
   spoken in two parts so the voice starts sooner, and `/jarvis:talk` sends the reply before the mic finishes

@@ -98,6 +98,26 @@ def _owner_hint() -> str | None:
     return st.get("session")
 
 
+# When the user's spoken reply was handed to Claude, so the next Stop can log how long
+# Claude took to answer it.
+def _asked_file():
+    return config.CACHE_DIR / "asked.json"
+
+
+def mark_asked(session: str | None) -> None:
+    config.write_json(_asked_file(), {"session": session, "at": time.time()})
+
+
+def take_asked(session: str | None) -> float | None:
+    """Seconds since this session's last spoken request was handed over (and forget it)."""
+    try:
+        st = json.loads(_asked_file().read_text())
+        _asked_file().unlink()
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return time.time() - st["at"] if st.get("session") == session else None
+
+
 # ----------------------------------------------------------------------------- inbox
 # Things the user said over Jarvis while Claude was still working. The next tool hook
 # (or the Stop hook) hands them to Claude.
@@ -503,9 +523,12 @@ def turn(cfg: dict, text: str, session: str | None = None) -> str | None:
                     return None
                 continue
             chime("Pop", cfg)
+            t_stt = time.monotonic()
             heard = transcriber(audio)
             if is_noise(heard):
                 continue
+            config.timing(f"you said ({len(audio) / 16000:.1f}s of speech, transcribed in "
+                          f"{time.monotonic() - t_stt:.2f}s): \"{heard}\"")
             if interrupted and is_pause_phrase(heard):
                 deadline = time.time() + float(cfg["converse_timeout"])
                 continue

@@ -188,6 +188,7 @@ def spoken_excerpt(reply: str, max_chars: int, mention_code: bool = True) -> str
 def on_stop() -> None:
     from . import converse
 
+    hook_t0 = time.monotonic()
     data = _read_input()
     cfg = config.load()
     if os.environ.get("JARVIS_VOICE_CHILD"):
@@ -207,6 +208,10 @@ def on_stop() -> None:
         return
     # Conversation mode: speak, listen, and hand the user's reply straight back to Claude.
     from . import daemon
+    session = data.get("session_id")
+    took = converse.take_asked(session)
+    if took is not None:
+        config.timing(f"Claude's reply took {took:.1f}s")
     converse.wait_for_capture()  # let the watcher finish catching what they said
     converse.stop_watcher()      # the turn below opens the mic itself
     stopped = converse.halted(data.get("session_id"))
@@ -220,10 +225,12 @@ def on_stop() -> None:
         return
     if stopped:  # they asked Claude to stop: skip reading the reply, just listen
         text = ""
-    heard = converse.turn(cfg, text, session=data.get("session_id"))
+    config.timing(f"stop hook ready to speak after {time.monotonic() - hook_t0:.2f}s")
+    heard = converse.turn(cfg, text, session=session)
     if heard is None:
         converse.end()
         return
+    converse.mark_asked(session)
     print(json.dumps({"decision": "block", "reason": converse.continuation(heard, cfg["address"])}))
 
 

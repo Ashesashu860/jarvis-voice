@@ -379,12 +379,15 @@ def cmd_daemon(args, cfg) -> int:
         print(json.dumps(st, indent=2) if st else "Speech daemon not running.")
         return 0
     if args.log:
-        try:
-            lines = daemon.LOG.read_text(errors="replace").splitlines()
-        except FileNotFoundError:
-            lines = []
-        timing = [ln for ln in lines if "first audio" in ln or "transcribed" in ln]
-        print("\n".join(timing[-20:]) or "No timings yet: they appear after Jarvis speaks or transcribes.")
+        lines = []
+        for path in (daemon.LOG, config.timings_file()):
+            try:
+                lines += [ln for ln in path.read_text(errors="replace").splitlines()
+                          if ln.startswith("[") and ("first audio" in ln or path == config.timings_file())]
+            except FileNotFoundError:
+                pass
+        lines.sort(key=lambda ln: ln[:10])  # [HH:MM:SS]: merge the two logs in time order
+        print("\n".join(lines[-args.lines:]) or "No timings yet: have a /jarvis:talk conversation first.")
         return 0
     return daemon.serve(args.first)
 
@@ -653,7 +656,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("daemon", help="background voice that makes replies start instantly")
     p.add_argument("--stop", action="store_true", help="stop the running daemon")
     p.add_argument("--status", action="store_true", help="show what the daemon is doing")
-    p.add_argument("--log", action="store_true", help="show recent speed timings")
+    p.add_argument("--log", action="store_true", help="show recent voice-turn timings")
+    p.add_argument("-n", "--lines", type=int, default=30, help="with --log: how many lines")
     p.add_argument("--first", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_daemon)
 
