@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Snappier voice turns.** Whisper runs on the Apple Silicon GPU when available (`whisper_device auto`; small.en
+  0.90 s -> 0.57 s per 4 s clip), the end-of-turn pause is 0.8 s instead of 1.0 s, a long first sentence is
+  spoken in two parts so the voice starts sooner, and `/jarvis:talk` sends the reply before the mic finishes
+  opening. `jarvis daemon --log` shows real timings.
 - **Replies are no longer read twice** in `/jarvis:talk`. A spoken follow-up is recorded as a hidden
   "Stop hook feedback" entry, which progress narration didn't treat as a new prompt, so it re-read the previous
   reply on the first step of the next turn. Narration also now skips any reply the Stop hook already spoke.

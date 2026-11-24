@@ -207,6 +207,7 @@ class ProcessedSpeaker:
         self.kept_gen = None     # an older generation trim() let finish
         self.busy = threading.Event()
         self.playing = None  # (monotonic start, loudness envelope), or "fallback"
+        self.first_start = None  # when audio first played since this was last reset (timing log)
         self.ir = _impulse_response()
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
@@ -304,6 +305,8 @@ class ProcessedSpeaker:
             else:
                 env = loudness_envelope(audio)
                 self.playing = (time.monotonic(), env)
+                if self.first_start is None:
+                    self.first_start = self.playing[0]
                 self.sd.play(audio, SR)
                 self.sd.wait()
             with self.lock:

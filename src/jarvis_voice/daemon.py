@@ -187,7 +187,8 @@ class DaemonSpeaker:
 class _Job:
     def __init__(self, text: str, session, ttl):
         self.text, self.session = text, session
-        self.deadline = time.monotonic() + ttl if ttl else None
+        self.created = time.monotonic()
+        self.deadline = self.created + ttl if ttl else None
         self.cancelled = False
 
 
@@ -262,7 +263,10 @@ class SpeechDaemon:
         self.touch()
         try:
             stt = self._ensure_stt()
+            t0 = time.monotonic()
             text = stt(audio)
+            _log(f"transcribed {len(audio) / 16000:.1f}s of speech in {time.monotonic() - t0:.2f}s "
+                 f"on {getattr(self.stt, 'device', '?')}")
         except Exception as e:  # noqa: BLE001 - the client falls back to its own Whisper
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
         finally:
@@ -277,7 +281,7 @@ class SpeechDaemon:
         """The loaded Whisper, (re)loaded if the model or vocabulary setting changed."""
         from .ears import make_transcriber
         cfg = config.load()
-        sig = (cfg["whisper"], cfg.get("vocabulary", ""))
+        sig = (cfg["whisper"], cfg.get("vocabulary", ""), cfg.get("whisper_device", "auto"))
         with self.stt_lock:
             if self.stt is None or sig != self.stt_sig:
                 self.stt, self.stt_sig = make_transcriber(cfg), sig
@@ -330,9 +334,13 @@ class SpeechDaemon:
                 if job.cancelled or self.speaker is None:
                     self.current = None
                     continue
-                for s in split_sentences(job.text):
+                self.speaker.first_start = None
+                for s in quick_start(split_sentences(job.text)):
                     self.speaker.say(s)
             self.speaker.wait()
+            first = getattr(self.speaker, "first_start", None)
+            if first and not job.cancelled:
+                _log(f"spoke for {str(job.session)[:8]}: first audio {first - job.created:.2f}s after the request")
             with self.lock:
                 self.current = None
                 self.last_active = idle_since = time.monotonic()
@@ -348,6 +356,26 @@ class SpeechDaemon:
             self.stopping = True
             self._cancel(None)
             self.wake.notify_all()
+
+
+def _log(msg: str) -> None:
+    """One line in speechd.log; `jarvis daemon --log` shows the recent ones."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+QUICK_START_CHARS = 60
+
+
+def quick_start(sentences: list[str]) -> list[str]:
+    """Split a long first sentence at its first comma, so the voice can start on the
+    short clause (~0.3 s to render) instead of the whole sentence (~0.8 s)."""
+    if not sentences or len(sentences[0]) <= QUICK_START_CHARS:
+        return sentences
+    first = sentences[0]
+    cut = first.find(", ", 15)
+    if cut == -1 or len(first) - cut < 15:
+        return sentences
+    return [first[: cut + 2], first[cut + 2:], *sentences[1:]]
 
 
 class _Locked:

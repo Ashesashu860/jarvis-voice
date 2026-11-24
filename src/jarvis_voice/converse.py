@@ -422,15 +422,24 @@ def _open_turn_local(cfg: dict):
     return speaker, mic["l"], transcriber
 
 
-def _open_turn_daemon(cfg: dict, session: str | None):
+def _open_turn_daemon(cfg: dict, session: str | None, text: str = ""):
     """Speaker and transcriber borrowed from the speech daemon, whose models are
-    already loaded: the reply starts in well under a second instead of ~3 s."""
+    already loaded: the reply starts in well under a second instead of ~3 s.
+
+    Returns (speaker, listener, transcriber, started). When the room's noise level is
+    already known, the reply is sent before the mic opens (`started`): the voice takes
+    ~0.3 s to render its first words, and the mic's 0.15 s check fits inside that, so
+    it doesn't hear Jarvis as background noise."""
     from .daemon import DaemonSpeaker
-    from .ears import Listener, make_fast_transcriber
+    from .ears import Listener, _noise_hint, make_fast_transcriber
 
     transcriber = make_fast_transcriber(cfg)  # first, so the daemon warms up meanwhile
+    speaker = DaemonSpeaker(session)
+    started = bool(text.strip()) and _noise_hint() is not None
+    if started:
+        speaker.say(text)
     listener = Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.6)
-    return DaemonSpeaker(session), listener, transcriber
+    return speaker, listener, transcriber, started
 
 
 def turn(cfg: dict, text: str, session: str | None = None) -> str | None:
@@ -442,8 +451,9 @@ def turn(cfg: dict, text: str, session: str | None = None) -> str | None:
     from .voice import chime
 
     address = cfg["address"]
+    started = False  # reply already sent to the daemon
     if cfg.get("speech_daemon", True):
-        speaker, listener, transcriber = _open_turn_daemon(cfg, session)
+        speaker, listener, transcriber, started = _open_turn_daemon(cfg, session, text)
     else:
         speaker, listener, transcriber = _open_turn_local(cfg)
     listener.start_continuous()
@@ -453,7 +463,9 @@ def turn(cfg: dict, text: str, session: str | None = None) -> str | None:
         speaker.wait()
 
     def speak_all() -> None:
-        if getattr(speaker, "splits_itself", False):
+        if started:
+            pass
+        elif getattr(speaker, "splits_itself", False):
             speaker.say(text)
         else:
             for s in split_sentences(text):  # sentence by sentence: the first plays while the rest render

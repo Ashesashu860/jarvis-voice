@@ -24,10 +24,11 @@ DEFAULTS: dict = {
     "wake": True,                  # jarvis talk: wait for "Hey Jarvis" (False = always listening)
     "wake_timeout": 10.0,          # seconds of silence before going back to standby
     "whisper": "base.en",
+    "whisper_device": "auto",      # auto (Apple GPU when available, else CPU) | cpu | mps
     # comma-separated names/jargon Whisper should spell right
     "vocabulary": "Jarvis, Claude, Claude Code, Next.js, React, TypeScript, JavaScript, Python, Flutter, GitHub, npm",
     "listen_while_working": True,  # /jarvis:talk: keep listening while Claude works, so you can cut in
-    "silence": 1.0,
+    "silence": 0.8,                # seconds of quiet that end your turn (lower = snappier, may cut you off)
     "sensitivity": 3.0,
     "converse_timeout": 60.0,      # /jarvis:talk: seconds of silence before the conversation ends
     "barge_in": True,             # jarvis talk: talking over Jarvis stops it and it listens
@@ -53,7 +54,7 @@ PID_FILE = CACHE_DIR / "speaking.pid"
 
 
 # Allowed values, checked by `jarvis config set` and when the file is loaded.
-CHOICES = {"engine": ("kokoro", "edge", "say")}
+CHOICES = {"engine": ("kokoro", "edge", "say"), "whisper_device": ("auto", "cpu", "mps")}
 RANGES = {"speed": (0.5, 2.0), "fx": (0.0, 3.0), "silence": (0.2, 5.0), "sensitivity": (1.0, 20.0),
           "wake_timeout": (1.0, 600.0), "converse_timeout": (5.0, 3600.0),
           "max_spoken_chars": (50, 10_000), "mac_rate": (80, 400), "daemon_idle_minutes": (1.0, 1440.0)}

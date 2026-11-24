@@ -107,6 +107,7 @@ jarvis demo                    # hear the current voice
 jarvis samples ./samples       # render voice variants to WAV to compare
 jarvis status                  # what's on, what's downloaded
 jarvis doctor                  # check the install and say how to fix problems (--mic, --fix)
+jarvis daemon --log            # recent timings: time to first audio, transcription speed
 jarvis config show             # all settings
 jarvis config set address boss # how Jarvis addresses you
 ```
@@ -128,7 +129,8 @@ Stored in `~/.config/jarvis-voice/config.json`. Change them with `jarvis config 
 | `wake` | `true` | `jarvis talk` waits for "Hey Jarvis" (`false` means always listening) |
 | `wake_timeout` | `10` | Seconds of silence before going back to standby |
 | `whisper` | `base.en` | Speech model: `tiny.en` (fastest) … `small.en` (more accurate) |
-| `silence` | `1.0` | Seconds of silence that end your turn |
+| `whisper_device` | `auto` | `auto` uses the Apple Silicon GPU when available (about 35% faster), else the CPU; or force `cpu` / `mps` |
+| `silence` | `0.8` | Seconds of silence that end your turn. Lower is snappier but may cut you off mid-pause |
 | `sensitivity` | `3.0` | Mic threshold over background noise. Lower is more sensitive |
 | `barge_in` | `true` | `jarvis talk`: speaking over Jarvis stops it and it listens |
 | `chimes` | `true` | Listening and heard sounds |

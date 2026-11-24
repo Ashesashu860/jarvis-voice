@@ -753,3 +753,71 @@ def test_narration_never_repeats_the_reply_the_stop_hook_read(tmp_path, monkeypa
     assert spoken == ["All done, sir."]
     hooks.on_tool()  # a tool call that still finds that reply in the transcript
     assert spoken == ["All done, sir."]  # not again
+
+
+# ----------------------------------------------------------------------------- speed: first words sooner
+def test_quick_start_splits_only_a_long_first_sentence():
+    from jarvis_voice.daemon import quick_start
+    long = "I've taken the liberty of reviewing the tests, and two of them are failing on the daemon path. "
+    assert quick_start([long, "Next."]) == ["I've taken the liberty of reviewing the tests, ",
+                                            "and two of them are failing on the daemon path. ", "Next."]
+    assert quick_start(["Certainly, sir. ", "More."]) == ["Certainly, sir. ", "More."]  # short: as is
+    no_comma = "This sentence is long enough to split but has no comma anywhere in it at all. "
+    assert quick_start([no_comma]) == [no_comma]
+    assert quick_start([]) == []
+
+
+def test_whisper_uses_apple_gpu_when_available(monkeypatch):
+    import sys
+    import types
+
+    from jarvis_voice import ears
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    fake = types.SimpleNamespace(get_supported_compute_types=lambda d: {"float16", "int8"})
+    monkeypatch.setitem(sys.modules, "ctranslate2", fake)
+    assert ears.whisper_devices("auto") == [("mps", "float16"), ("cpu", "int8")]
+    assert ears.whisper_devices("cpu") == [("cpu", "int8")]
+
+    def no_mps(d):
+        raise ValueError("unsupported device mps")
+    fake.get_supported_compute_types = no_mps  # older ctranslate2
+    assert ears.whisper_devices("auto") == [("cpu", "int8")]
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    fake.get_supported_compute_types = lambda d: {"float16"}
+    assert ears.whisper_devices("auto") == [("cpu", "int8")]  # Intel Mac: CPU
+
+
+def test_transcriber_falls_back_to_cpu_if_gpu_fails(monkeypatch):
+    import sys
+    import types
+
+    from jarvis_voice import ears
+    tried = []
+
+    class FakeModel:
+        def __init__(self, name, device, compute_type):
+            tried.append(device)
+            if device == "mps":
+                raise RuntimeError("Metal not available")
+
+        def transcribe(self, audio, **kw):
+            return iter([]), None
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeModel))
+    monkeypatch.setattr(ears, "whisper_devices", lambda d: [("mps", "float16"), ("cpu", "int8")])
+    t = ears.Transcriber("small.en")
+    assert tried == ["mps", "cpu"] and t.device == "cpu"
+
+
+def test_daemon_logs_time_to_first_audio(capsys):
+    fake = FakeSpeaker()
+    fake.first_start = None
+    d = _daemon_with(fake)
+    d.say("Timed reply.", "sess-123456789", None)
+    assert _until(lambda: fake.said == ["Timed reply."])
+    fake.first_start = _time.monotonic()  # the speaker reports when audio began
+    fake.release.set()
+    err = []
+    assert _until(lambda: err.append(capsys.readouterr().err) or "first audio" in "".join(err))
+    assert "spoke for sess-123: first audio" in "".join(err)
+    d.stop()
