@@ -842,3 +842,22 @@ def test_turn_timings_are_logged(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert 'transcribed in 0.55s): "hello"' in out and "reply took 4.2s" in out
     assert "first audio 0.47s" in out and "daemon 1 up" not in out
+
+
+def test_stop_hook_ignores_capture_left_by_a_dead_listener(tmp_path, monkeypatch):
+    """A capture file left by a listener that died made the Stop hook wait up to 90 s."""
+    import os
+
+    from jarvis_voice import converse
+    monkeypatch.setattr(converse, "CAPTURE_FILE", tmp_path / "capturing")
+    monkeypatch.setattr(converse, "WATCH_FILE", tmp_path / "watch.json")
+    (tmp_path / "capturing").write_text(str(_time.time()))
+    config.write_json(tmp_path / "watch.json", {"pid": 999_999_999})  # no such process
+    assert not converse.capturing()
+    config.write_json(tmp_path / "watch.json", {"pid": os.getpid()})   # alive
+    assert converse.capturing()
+    (tmp_path / "capturing").write_text(str(_time.time() - 120))      # far too old
+    assert not converse.capturing()
+    t0 = _time.monotonic()
+    converse.wait_for_capture()
+    assert _time.monotonic() - t0 < 0.5

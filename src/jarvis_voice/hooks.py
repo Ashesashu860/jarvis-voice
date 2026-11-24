@@ -212,12 +212,23 @@ def on_stop() -> None:
     took = converse.take_asked(session)
     if took is not None:
         config.timing(f"Claude's reply took {took:.1f}s")
+    phases, t = [], time.monotonic()
+
+    def phase(name):
+        nonlocal t
+        now = time.monotonic()
+        phases.append(f"{name} {now - t:.2f}s")
+        t = now
+    phase("start")
     converse.wait_for_capture()  # let the watcher finish catching what they said
+    phase("waiting for the background listener")
     converse.stop_watcher()      # the turn below opens the mic itself
+    phase("stopping it")
     stopped = converse.halted(data.get("session_id"))
     converse.clear_halt()
     daemon.settle()              # finish the sentence being said, then go quiet
     hush()
+    phase("letting speech finish")
     pending = converse.pop_all()
     if pending:  # they spoke over a progress update and Claude hasn't seen it yet
         print(json.dumps({"decision": "block",
@@ -225,7 +236,7 @@ def on_stop() -> None:
         return
     if stopped:  # they asked Claude to stop: skip reading the reply, just listen
         text = ""
-    config.timing(f"stop hook ready to speak after {time.monotonic() - hook_t0:.2f}s")
+    config.timing(f"stop hook ready to speak after {time.monotonic() - hook_t0:.2f}s ({', '.join(phases)})")
     heard = converse.turn(cfg, text, session=session)
     if heard is None:
         converse.end()

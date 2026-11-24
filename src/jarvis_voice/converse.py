@@ -397,11 +397,15 @@ CAPTURE_FILE = config.CACHE_DIR / "capturing"
 
 
 def capturing() -> bool:
-    """Is a background update busy recording/transcribing the user right now?"""
+    """Is the background listener busy recording/transcribing the user right now?
+    A capture file left behind by a listener that has since died doesn't count."""
     try:
-        return time.time() - float(CAPTURE_FILE.read_text()) < 90
+        if time.time() - float(CAPTURE_FILE.read_text()) >= CAPTURE_STALE_S:
+            return False
     except (FileNotFoundError, ValueError):
         return False
+    st = _watch_state()
+    return bool(st and st.get("pid") and _alive(int(st["pid"])))
 
 
 def capture_done() -> None:
@@ -411,7 +415,11 @@ def capture_done() -> None:
         pass
 
 
-def wait_for_capture(limit_s: float = 90) -> None:
+CAPTURE_STALE_S = 30.0  # a capture can't sensibly still be going after this long
+CAPTURE_WAIT_S = 6.0    # the Stop hook waits at most this long for one to finish
+
+
+def wait_for_capture(limit_s: float = CAPTURE_WAIT_S) -> None:
     end = time.time() + limit_s
     while capturing() and time.time() < end:
         time.sleep(0.2)
