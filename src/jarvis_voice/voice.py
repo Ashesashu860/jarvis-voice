@@ -3,6 +3,7 @@
 voice: the Kokoro voice is a weighted blend of stock open-source voices."""
 from __future__ import annotations
 
+import os
 import queue
 import re
 import shutil
@@ -24,6 +25,10 @@ KOKORO_FILES = {
     "voices-v1.0.bin": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
 }
 
+DOWNLOAD_TIMEOUT_S = 60
+KOKORO_VOICES = ("bm_daniel", "bm_george", "bm_fable", "bm_lewis",
+                 "bf_alice", "bf_emma", "bf_isabella", "bf_lily")  # British voices in voices-v1.0.bin
+
 MAC_VOICE_PREFERENCE = [
     "Jamie (Premium)", "Daniel (Premium)", "Daniel (Enhanced)",
     "Oliver (Enhanced)", "Arthur (Enhanced)", "Daniel",
@@ -39,12 +44,14 @@ def ensure_kokoro(quiet: bool = False) -> None:
     config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
     for name, url in KOKORO_FILES.items():
         dest = config.MODELS_DIR / name
-        if dest.exists() and dest.stat().st_size > 0:
+        if dest.exists() and dest.stat().st_size > 0 and not any(
+                p.startswith(name) for p in model_problems()):
             continue
         if not quiet:
             log(f"Downloading voice model {name} (one time)...")
         tmp = dest.with_suffix(dest.suffix + ".part")
-        with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+        # A timeout so a stalled connection fails instead of hanging setup forever.
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as r, open(tmp, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             done = 0
             while chunk := r.read(1 << 20):
@@ -55,11 +62,33 @@ def ensure_kokoro(quiet: bool = False) -> None:
                           file=sys.stderr, flush=True)
         if not quiet:
             print(file=sys.stderr)
+        if total and done != total:  # cut off mid-way: don't keep a broken model
+            tmp.unlink(missing_ok=True)
+            raise OSError(f"download of {name} was incomplete ({done} of {total} bytes); "
+                          "run `jarvis setup` again")
         tmp.rename(dest)
+        (config.MODELS_DIR / f"{name}.size").write_text(str(done))
+
+
+def model_problems() -> list[str]:
+    """Model files that are missing or don't match the size they were downloaded at."""
+    problems = []
+    for name in KOKORO_FILES:
+        path = config.MODELS_DIR / name
+        if not path.exists():
+            problems.append(f"{name} missing")
+            continue
+        try:
+            expected = int((config.MODELS_DIR / f"{name}.size").read_text())
+        except (FileNotFoundError, ValueError):
+            continue  # downloaded by an older version: nothing to compare against
+        if path.stat().st_size != expected:
+            problems.append(f"{name} is damaged ({path.stat().st_size} of {expected} bytes)")
+    return problems
 
 
 def kokoro_ready() -> bool:
-    return all((config.MODELS_DIR / n).exists() for n in KOKORO_FILES)
+    return not model_problems()
 
 
 # ----------------------------------------------------------------------------- macOS say
@@ -73,22 +102,36 @@ def pick_mac_voice(requested: str | None) -> str:
     return next((v for v in MAC_VOICE_PREFERENCE if v in names), "Daniel")
 
 
+def system_voice_command(voice: str, rate: int) -> list[str] | None:
+    """The built-in speech command for this OS: macOS `say`, else espeak-ng / espeak
+    (common on Linux) in a British voice. None if there is none."""
+    if shutil.which("say"):
+        return ["say", "-v", voice, "-r", str(rate)]
+    for prog in ("espeak-ng", "espeak"):
+        if shutil.which(prog):
+            return [prog, "-v", "en-gb", "-s", str(rate)]
+    return None
+
+
 class SaySpeaker:
-    """macOS `say`; silently does nothing where `say` is unavailable."""
+    """The system voice (macOS `say`, or espeak-ng on Linux); silently does nothing
+    where neither is available."""
 
     def __init__(self, voice: str | None = None, rate: int = 185):
         self.voice, self.rate = pick_mac_voice(voice), rate
         self.q: queue.Queue[str] = queue.Queue()
         self.proc: subprocess.Popen | None = None
         self.busy = threading.Event()
-        self.available = bool(shutil.which("say"))
+        self.cmd = system_voice_command(self.voice, rate)
+        self.available = self.cmd is not None
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
             text = self.q.get()
             if self.available:
-                self.proc = subprocess.Popen(["say", "-v", self.voice, "-r", str(self.rate), text])
+                self.proc = subprocess.Popen([*self.cmd, text],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.proc.wait()
                 self.proc = None
             if self.q.empty():
@@ -279,10 +322,10 @@ class KokoroSpeaker(ProcessedSpeaker):
         from kokoro_onnx import Kokoro
         ensure_kokoro()
         self.kokoro = Kokoro(str(config.MODELS_DIR / "kokoro-v1.0.onnx"), str(config.MODELS_DIR / "voices-v1.0.bin"))
-        parts = [p.strip().split(":") for p in blend.split(",") if p.strip()]
-        weights = np.array([float(p[1]) if len(p) > 1 else 1.0 for p in parts], dtype=np.float32)
+        parts = config.parse_blend(blend)
+        weights = np.array([w for _, w in parts], dtype=np.float32)
         weights /= weights.sum()
-        self.style = sum(w * self.kokoro.get_voice_style(p[0].strip()) for w, p in zip(weights, parts))
+        self.style = sum(w * self.kokoro.get_voice_style(name) for w, (name, _) in zip(weights, parts, strict=True))
         self.speed = speed
         super().__init__(fx, fallback)
 
@@ -300,6 +343,7 @@ class EdgeSpeaker(ProcessedSpeaker):
 
     def __init__(self, voice: str, rate: str, pitch: str, fx: float, fallback: SaySpeaker | None):
         import asyncio
+
         import edge_tts  # noqa: F401  (fail early if the extra is missing)
         self.voice, self.rate, self.pitch = voice, rate, pitch
         self.loop = asyncio.new_event_loop()
@@ -310,6 +354,7 @@ class EdgeSpeaker(ProcessedSpeaker):
 
     async def _synth(self, text: str) -> np.ndarray:
         import io
+
         import av
         import edge_tts
         mp3 = bytearray()
@@ -336,7 +381,7 @@ def make_speaker(cfg: dict, **overrides):
         if engine == "edge":
             return EdgeSpeaker(cfg["edge_voice"], cfg["edge_rate"], cfg["edge_pitch"], cfg["fx"], fallback)
     except Exception as e:
-        log(f"[{engine} voice unavailable ({type(e).__name__}: {e}); using macOS voice]")
+        log(f"[{engine} voice unavailable ({type(e).__name__}: {e}); using the system voice]")
     return fallback
 
 
@@ -348,12 +393,26 @@ def describe(cfg: dict) -> str:
     return f"macOS {pick_mac_voice(cfg['mac_voice'])}"
 
 
+# macOS system sound -> the closest freedesktop sound theme file (Linux).
+_FREEDESKTOP_SOUNDS = {"Tink": "message", "Pop": "complete", "Bottle": "bell"}
+
+
+def chime_command(name: str) -> list[str] | None:
+    """How to play a listening/heard chime on this OS, or None if we can't."""
+    if shutil.which("afplay"):
+        return ["afplay", f"/System/Library/Sounds/{name}.aiff"]
+    sound = f"/usr/share/sounds/freedesktop/stereo/{_FREEDESKTOP_SOUNDS.get(name, 'message')}.oga"
+    if shutil.which("paplay") and os.path.exists(sound):
+        return ["paplay", sound]
+    return None
+
+
 def chime(name: str, cfg: dict | None = None, wait: bool = False) -> None:
     if cfg is not None and not cfg.get("chimes", True):
         return
-    if shutil.which("afplay"):
-        p = subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = chime_command(name)
+    if cmd:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if wait:
             p.wait()
 

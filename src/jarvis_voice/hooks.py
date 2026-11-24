@@ -77,7 +77,7 @@ def speak_detached(text: str, session: str | None = None, ttl: float | None = No
         daemon.speak(text, session=session, ttl=ttl)
         return
     hush(session)
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, path = tempfile.mkstemp(prefix="say-", suffix=".txt", dir=config.CACHE_DIR)
     with os.fdopen(fd, "w") as f:
         f.write(text)
@@ -85,7 +85,7 @@ def speak_detached(text: str, session: str | None = None, ttl: float | None = No
     proc = subprocess.Popen(cmd,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
-    config.PID_FILE.write_text(json.dumps({"pid": proc.pid, "session": session}))
+    config.write_json(config.PID_FILE, {"pid": proc.pid, "session": session})
 
 
 # ----------------------------------------------------------------------------- reply extraction
@@ -146,11 +146,12 @@ def last_reply_from_transcript(path: str) -> str:
     return ""
 
 
-def spoken_excerpt(reply: str, max_chars: int) -> str:
+def spoken_excerpt(reply: str, max_chars: int, mention_code: bool = True) -> str:
     """The part of a reply worth saying aloud: prose before the first code block/table,
     cut at a sentence boundary."""
-    reply = re.split(r"\n```|\n\|", reply, maxsplit=1)[0]
-    sentences = split_sentences(clean_for_speech(reply))
+    parts = re.split(r"\n```|\n\|", reply, maxsplit=1)
+    prose, cut_at_code = parts[0], len(parts) > 1
+    sentences = split_sentences(clean_for_speech(prose))
     out, total = [], 0
     for s in sentences:
         if out and total + len(s) > max_chars:
@@ -158,6 +159,9 @@ def spoken_excerpt(reply: str, max_chars: int) -> str:
             break
         out.append(s.strip())
         total += len(s)
+    else:
+        if cut_at_code and out and mention_code:  # say why it stopped, rather than just trailing off
+            out.append("The details are on screen.")
     return " ".join(out)
 
 
@@ -313,7 +317,7 @@ def on_tool() -> None:
 
     line = None
     note = last_reply_from_transcript(data["transcript_path"]) if data.get("transcript_path") else ""
-    note = spoken_excerpt(note, 220) if note else ""
+    note = spoken_excerpt(note, 220, mention_code=False) if note else ""
     key = hashlib.sha1(note.encode()).hexdigest() if note else None
     if note and key != st.get("note"):
         line, st["note"] = note, key
@@ -322,8 +326,8 @@ def on_tool() -> None:
     if not line:
         return
     st["tool_at"] = st["seen"] = now
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    NARRATE_FILE.write_text(json.dumps(states))
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config.write_json(NARRATE_FILE, states)
     speak_detached(line, session=session, ttl=NARRATION_TTL_S)
 
 

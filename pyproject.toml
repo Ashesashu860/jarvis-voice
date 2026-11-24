@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jarvis-voice"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Talk to Claude Code and hear it answer in a refined, JARVIS-style British AI voice."
 readme = "README.md"
 license = "MIT"
@@ -28,7 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 online = ["edge-tts>=6.1"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.6"]
 
 [project.scripts]
 jarvis = "jarvis_voice.cli:main"
@@ -37,5 +37,18 @@ jarvis = "jarvis_voice.cli:main"
 Homepage = "https://github.com/Ashesashu860/jarvis-voice"
 Issues = "https://github.com/Ashesashu860/jarvis-voice/issues"
 
+[tool.hatch.version]
+path = "src/jarvis_voice/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/jarvis_voice"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

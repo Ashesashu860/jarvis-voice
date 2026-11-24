@@ -92,7 +92,7 @@ def is_sleep_phrase(text: str) -> bool:
 
 def cmd_talk(args, cfg) -> int:
     from .brain import Brain
-    from .ears import BargeIn, Listener, make_transcriber, is_noise
+    from .ears import BargeIn, Listener, is_noise, make_transcriber
     from .voice import chime, describe, make_speaker
 
     if not shutil.which("claude"):
@@ -258,7 +258,7 @@ def cmd_talk(args, cfg) -> int:
 # ----------------------------------------------------------------------------- listen / say
 def cmd_listen(args, cfg) -> int:
     """Record one spoken prompt and print its transcript (used by /jarvis:listen)."""
-    from .ears import Listener, make_transcriber, is_noise
+    from .ears import Listener, is_noise, make_transcriber
     from .hooks import hush
     from .voice import chime
 
@@ -423,6 +423,99 @@ def cmd_status(args, cfg) -> int:
     return 0
 
 
+def _installed_plugin() -> str | None:
+    """Version of the jarvis plugin Claude Code has installed, if any (best effort)."""
+    path = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    plugins = data.get("plugins", data) if isinstance(data, dict) else {}
+    for key, entries in plugins.items():
+        if key.startswith("jarvis@") and entries:
+            entry = entries[0] if isinstance(entries, list) else entries
+            return str(entry.get("version") or "unknown version")
+    return None
+
+
+def cmd_doctor(args, cfg) -> int:
+    """Check everything Jarvis depends on and say how to fix what's wrong."""
+    import stat
+
+    from .voice import KOKORO_VOICES, model_problems
+    problems = 0
+
+    def report(ok: bool | None, what: str, fix: str = "") -> None:
+        nonlocal problems
+        mark = f"{C_GRN}ok{C_RST}  " if ok else f"{C_YEL}warn{C_RST}" if ok is None else f"{C_YEL}FAIL{C_RST}"
+        print(f"  {mark} {what}" + (f"\n         {C_DIM}{fix}{C_RST}" if fix and not ok else ""))
+        problems += ok is False
+
+    print(f"jarvis-voice {__version__} doctor")
+    found = shutil.which("jarvis")
+    report(bool(found), f"`jarvis` on PATH ({found or 'not found'})",
+           "The Claude Code hooks call `jarvis`; without it they silently do nothing. "
+           "Add ~/.local/bin to PATH in your shell profile, then restart Claude Code.")
+    report(bool(shutil.which("claude")), "Claude Code CLI (`claude`)", "Install Claude Code.")
+    plugin = _installed_plugin()
+    report(True if plugin else None, f"Claude Code plugin: {plugin or 'not found in installed plugins'}",
+           "Inside Claude Code: /plugin marketplace add Ashesashu860/jarvis-voice, then "
+           "/plugin install jarvis@jarvis-voice (ignore this if you use --plugin-dir).")
+    if plugin and plugin not in ("unknown version", __version__):
+        report(None, f"plugin {plugin} differs from installed jarvis {__version__}",
+               "Update the plugin: /plugin update jarvis@jarvis-voice")
+    try:
+        json.loads(config.CONFIG_FILE.read_text())
+        report(True, f"settings file {config.CONFIG_FILE}")
+    except FileNotFoundError:
+        report(True, "settings: all defaults")
+    except ValueError as e:
+        report(False, f"settings file is not valid JSON ({e})", "Fix it, or run: jarvis config reset")
+    if cfg["engine"] == "kokoro":
+        bad = model_problems()
+        report(not bad, "voice model " + ("downloaded" if not bad else f"problem: {'; '.join(bad)}"),
+               "Run: jarvis setup")
+        unknown = [n for n, _ in config.parse_blend(cfg["blend"]) if n not in KOKORO_VOICES]
+        if unknown:
+            report(None, f"blend uses non-British or unknown voices: {', '.join(unknown)}",
+                   f"British voices: {', '.join(KOKORO_VOICES)}")
+    if config.CACHE_DIR.exists():
+        mode = stat.S_IMODE(config.CACHE_DIR.stat().st_mode)
+        private = not mode & 0o077
+        if not private and args.fix:
+            os.chmod(config.CACHE_DIR, 0o700)
+            private = True
+        report(private, f"cache folder is private to you ({config.CACHE_DIR})",
+               "It holds transcripts of what you say. Run: jarvis doctor --fix")
+    try:
+        import sounddevice as sd
+        out, inp = sd.query_devices(kind="output"), sd.query_devices(kind="input")
+        report(True, f"speakers: {out['name']}")
+        report(True, f"microphone: {inp['name']}")
+    except Exception as e:  # noqa: BLE001 - PortAudio raises several types
+        report(False, f"audio devices unavailable ({e})", "Check your sound settings.")
+    if args.mic:
+        import numpy as np
+        try:
+            import sounddevice as sd
+            rec = sd.rec(16000, samplerate=16000, channels=1, dtype="float32")
+            sd.wait()
+            heard = float(np.abs(rec).max()) > 0
+            report(heard, "microphone records sound",
+                   "Allow microphone access for your terminal app in System Settings, "
+                   "Privacy & Security, Microphone.")
+        except Exception as e:  # noqa: BLE001
+            report(False, f"microphone test failed ({e})")
+    from . import daemon
+    st = daemon.request("status") if cfg["speech_daemon"] else None
+    report(True, "speech daemon " + (f"running (pid {st['pid']})" if st else
+                                     "not running (starts on the first reply)" if cfg["speech_daemon"] else "off"))
+    print(f"\n{'All good.' if not problems else f'{problems} problem(s) found.'}"
+          + ("" if args.mic else f" {C_DIM}(add --mic to test recording){C_RST}"))
+    return 1 if problems else 0
+
+
 def cmd_config(args, cfg) -> int:
     if args.action == "show" or not args.action:
         print(json.dumps(cfg, indent=2))
@@ -526,6 +619,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("on", help="read Claude Code replies aloud").set_defaults(func=cmd_toggle(True))
     sub.add_parser("off", help="stop reading Claude Code replies aloud").set_defaults(func=cmd_toggle(False))
     sub.add_parser("status", help="show settings and readiness").set_defaults(func=cmd_status)
+
+    p = sub.add_parser("doctor", help="check the install and say how to fix problems")
+    p.add_argument("--mic", action="store_true", help="also record a second to test the microphone")
+    p.add_argument("--fix", action="store_true", help="fix what can be fixed automatically")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("config", help="show or change settings")
     p.add_argument("action", nargs="?", choices=["show", "set", "reset", "path"])

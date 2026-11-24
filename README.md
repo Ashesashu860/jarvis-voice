@@ -106,6 +106,7 @@ jarvis say "Good evening."     # speak any text (or pipe text in)
 jarvis demo                    # hear the current voice
 jarvis samples ./samples       # render voice variants to WAV to compare
 jarvis status                  # what's on, what's downloaded
+jarvis doctor                  # check the install and say how to fix problems (--mic, --fix)
 jarvis config show             # all settings
 jarvis config set address boss # how Jarvis addresses you
 ```

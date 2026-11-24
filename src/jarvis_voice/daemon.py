@@ -58,7 +58,7 @@ def speak(text: str, session: str | None = None, ttl: float | None = None) -> No
     """Hand text to the daemon, starting it (with the text) if it isn't running."""
     if request("say", text=text, session=session, ttl=ttl) is not None:
         return
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, path = tempfile.mkstemp(prefix="say-", suffix=".json", dir=config.CACHE_DIR)
     with os.fdopen(fd, "w") as f:
         json.dump({"text": text, "session": session, "ttl": ttl}, f)
@@ -246,7 +246,7 @@ def serve(first: str | None = None) -> int:
     """Run the daemon (only one per user; a second start hands its text to the first)."""
     import fcntl
 
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     first_job = None
     if first:
         try:
@@ -282,7 +282,11 @@ def serve(first: str | None = None) -> int:
     except FileNotFoundError:
         pass
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(str(SOCK))
+    old_umask = os.umask(0o077)  # the socket is owner-only from the moment it exists
+    try:
+        srv.bind(str(SOCK))
+    finally:
+        os.umask(old_umask)
     os.chmod(SOCK, 0o600)
     srv.listen(16)
     srv.settimeout(5.0)
@@ -291,7 +295,7 @@ def serve(first: str | None = None) -> int:
         while True:
             try:
                 conn, _ = srv.accept()
-            except socket.timeout:
+            except TimeoutError:
                 if d.idle_expired():
                     break
                 continue

@@ -120,7 +120,9 @@ def test_sleep_phrases():
 
 def test_spoken_excerpt_stops_at_code_and_length():
     reply = "Done, sir. I fixed the bug.\n```py\nprint(1)\n```\nMore text."
-    assert hooks.spoken_excerpt(reply, 600) == "Done, sir. I fixed the bug."
+    assert hooks.spoken_excerpt(reply, 600) == "Done, sir. I fixed the bug. The details are on screen."
+    assert hooks.spoken_excerpt(reply, 600, mention_code=False) == "Done, sir. I fixed the bug."
+    assert hooks.spoken_excerpt("Done, sir.", 600) == "Done, sir."  # no code: nothing added
     long = " ".join(f"Sentence number {i}." for i in range(100))
     out = hooks.spoken_excerpt(long, 100)
     assert out.endswith("The rest is on screen.") and len(out) < 160
@@ -212,6 +214,7 @@ def test_stop_hook_blocks_with_spoken_reply(tmp_path, monkeypatch, capsys):
 # ----------------------------------------------------------------------------- spoken text
 import pytest  # noqa: E402
 
+
 @pytest.mark.parametrize("raw, spoken", [
     ("I edited `speak_detached` in src/jarvis_voice/hooks.py:42.", "I edited speak detached in hooks dot py, line 42."),
     ("Released v0.3.0 at ~60 ms, 400 MB, 10s.",
@@ -230,7 +233,8 @@ def test_clean_for_speech_reads_code_naturally(raw, spoken):
 
 
 def test_hooks_do_not_import_numpy():
-    import subprocess, sys
+    import subprocess
+    import sys
     code = "import sys, jarvis_voice.hooks; print('numpy' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True).stdout.strip()
     assert out == "False"
@@ -493,3 +497,91 @@ def test_last_reply_reads_from_the_end(tmp_path):
     assert hooks.last_reply_from_transcript(str(p)) == "All done, sir."
     p.write_text("\n".join(_json.dumps(r) for r in [*filler, user]))  # no trailing newline
     assert hooks.last_reply_from_transcript(str(p)) == ""
+
+
+def test_inbox_keeps_text_pushed_while_popping(tmp_path, monkeypatch):
+    from jarvis_voice import converse
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(converse, "INBOX_FILE", tmp_path / "inbox.jsonl")
+    converse.push("first")
+    real_read = type(tmp_path).read_text
+
+    def read_then_push(self, *a, **k):  # the watcher appends while we're reading
+        out = real_read(self, *a, **k)
+        if self.name.endswith(".taken"):
+            converse.push("second")
+        return out
+    monkeypatch.setattr(type(tmp_path), "read_text", read_then_push)
+    assert converse.pop_all() == ["first"]
+    monkeypatch.undo()
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(converse, "INBOX_FILE", tmp_path / "inbox.jsonl")
+    assert converse.pop_all() == ["second"]  # not lost
+    assert list(tmp_path.glob(".*taken")) == []
+
+
+def test_atomic_write_leaves_no_temp_files(tmp_path):
+    target = tmp_path / "sub" / "state.json"
+    config.write_json(target, {"a": 1})
+    config.write_json(target, {"a": 2})
+    assert json.loads(target.read_text()) == {"a": 2}
+    assert [p.name for p in target.parent.iterdir()] == ["state.json"]
+
+
+def test_config_set_validates_values():
+    assert config.coerce("speed", "1.2") == 1.2
+    assert config.coerce("speed", "default") == config.DEFAULTS["speed"]
+    assert config.coerce("mac_voice", "none") is None
+    bad = [("speed", "9"), ("speed", "fast"), ("speed", "none"), ("engine", "siri"),
+           ("blend", "Daniel"), ("blend", "bm_daniel:0"), ("blend", "bm_daniel:x"), ("address", "  ")]
+    for key, value in bad:
+        with pytest.raises(ValueError):
+            config.coerce(key, value)
+    assert config.parse_blend("bm_daniel:0.6, bm_george") == [("bm_daniel", 0.6), ("bm_george", 1.0)]
+
+
+def test_config_load_ignores_bad_values(tmp_path, monkeypatch, capsys):
+    f = tmp_path / "config.json"
+    f.write_text(json.dumps({"speed": "fast", "fx": 0.2, "engine": "siri", "address": "boss"}))
+    monkeypatch.setattr(config, "CONFIG_FILE", f)
+    cfg = config.load()
+    assert cfg["speed"] == config.DEFAULTS["speed"] and cfg["engine"] == "kokoro"
+    assert cfg["fx"] == 0.2 and cfg["address"] == "boss"
+    assert "ignoring setting" in capsys.readouterr().err
+
+
+def test_damaged_model_is_detected(tmp_path, monkeypatch):
+    from jarvis_voice import voice
+    monkeypatch.setattr(config, "MODELS_DIR", tmp_path)
+    for name in voice.KOKORO_FILES:
+        (tmp_path / name).write_bytes(b"x" * 10)
+    assert voice.kokoro_ready()  # older installs have no recorded size: trusted
+    first = next(iter(voice.KOKORO_FILES))
+    (tmp_path / f"{first}.size").write_text("20")
+    assert not voice.kokoro_ready()
+    assert "damaged" in voice.model_problems()[0]
+    (tmp_path / first).unlink()
+    assert voice.model_problems()[0] == f"{first} missing"
+
+
+def test_system_voice_and_chimes_fall_back_on_linux(monkeypatch):
+    from jarvis_voice import voice
+    have = {"espeak-ng", "paplay"}
+    monkeypatch.setattr(voice.shutil, "which", lambda p: f"/usr/bin/{p}" if p in have else None)
+    assert voice.system_voice_command("Daniel", 185) == ["espeak-ng", "-v", "en-gb", "-s", "185"]
+    monkeypatch.setattr(voice.os.path, "exists", lambda p: True)
+    assert voice.chime_command("Pop")[0] == "paplay"
+    have.clear()
+    assert voice.system_voice_command("Daniel", 185) is None and voice.chime_command("Pop") is None
+
+
+def test_doctor_runs_and_reports(tmp_path, monkeypatch, capsys):
+    from jarvis_voice import cli, daemon
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(config, "MODELS_DIR", tmp_path / "models")
+    monkeypatch.setattr(daemon, "request", lambda *a, **k: None)
+    code = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "voice model problem" in out and "jarvis setup" in out
+    assert code == 1

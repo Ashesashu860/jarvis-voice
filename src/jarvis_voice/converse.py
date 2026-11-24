@@ -22,8 +22,8 @@ def start() -> None:
     """Arm conversation mode; the next Claude Code session to finish a reply claims it."""
     stop_watcher()
     clear_halt()
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _write_json(STATE_FILE, {"session": _owner_hint(), "since": time.time()})
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config.write_json(STATE_FILE, {"session": _owner_hint(), "since": time.time()})
 
 
 def end() -> None:
@@ -63,7 +63,7 @@ def claim(session_id: str | None) -> bool:
         if owner is not None and owner != session_id:
             return False
         st["session"] = session_id
-        _write_json(STATE_FILE, st)
+        config.write_json(STATE_FILE, st)
         return True
     return st["session"] == session_id
 
@@ -80,12 +80,12 @@ def note_owner(session_id: str | None) -> None:
     conversation for it straight away."""
     if not session_id:
         return
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _write_json(OWNER_FILE, {"session": session_id, "at": time.time()})
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config.write_json(OWNER_FILE, {"session": session_id, "at": time.time()})
     st = _state()
     if st is not None and st.get("session") is None:
         st["session"] = session_id
-        _write_json(STATE_FILE, st)
+        config.write_json(STATE_FILE, st)
 
 
 def _owner_hint() -> str | None:
@@ -98,14 +98,6 @@ def _owner_hint() -> str | None:
     return st.get("session")
 
 
-def _write_json(path, data) -> None:
-    """Write atomically, so a hook in another process never reads half a file."""
-    import os
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data))
-    os.replace(tmp, path)
-
-
 # ----------------------------------------------------------------------------- inbox
 # Things the user said over Jarvis while Claude was still working. The next tool hook
 # (or the Stop hook) hands them to Claude.
@@ -113,17 +105,24 @@ INBOX_FILE = config.CACHE_DIR / "inbox.jsonl"
 
 
 def push(text: str) -> None:
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     with open(INBOX_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps({"text": text, "at": time.time()}) + "\n")
 
 
 def pop_all() -> list[str]:
+    """Take everything in the inbox. The file is renamed away before it's read, so
+    text the watcher appends meanwhile lands in a fresh inbox instead of being lost."""
+    import os
+    taken = INBOX_FILE.with_name(f".{INBOX_FILE.name}.{os.getpid()}.taken")
     try:
-        lines = INBOX_FILE.read_text(encoding="utf-8").splitlines()
-        INBOX_FILE.unlink()
+        os.replace(INBOX_FILE, taken)
     except FileNotFoundError:
         return []
+    try:
+        lines = taken.read_text(encoding="utf-8").splitlines()
+    finally:
+        taken.unlink(missing_ok=True)
     out = []
     for line in lines:
         try:
@@ -185,8 +184,8 @@ def is_echo(heard: str, recent: list[str]) -> bool:
 
 
 def halt(session: str | None, text: str) -> None:
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    HALT_FILE.write_text(json.dumps({"session": session, "text": text, "at": time.time()}))
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config.write_json(HALT_FILE, {"session": session, "text": text, "at": time.time()})
 
 
 def halted(session: str | None) -> str | None:
@@ -229,10 +228,10 @@ def ensure_watcher(session: str | None) -> None:
     """Start the background listener for this session unless it's already running."""
     import subprocess
     import sys
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = _watch_state()
     if st and st.get("session") == session and _alive(int(st.get("pid", 0))):
-        WATCH_FILE.write_text(json.dumps({**st, "beat": time.time()}))
+        config.write_json(WATCH_FILE, {**st, "beat": time.time()})
         return
     cmd = [sys.executable, "-m", "jarvis_voice", "watch"] + (["--session", session] if session else [])
     subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -242,7 +241,7 @@ def ensure_watcher(session: str | None) -> None:
 def heartbeat() -> None:
     st = _watch_state()
     if st:
-        WATCH_FILE.write_text(json.dumps({**st, "beat": time.time()}))
+        config.write_json(WATCH_FILE, {**st, "beat": time.time()})
 
 
 def stop_watcher() -> None:
@@ -297,13 +296,13 @@ def watch(cfg: dict, session: str | None) -> int:
     from .ears import BargeIn, Listener, is_noise, make_transcriber
     from .voice import chime
 
-    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = open(WATCH_LOCK, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return 0  # another watcher is already listening
-    WATCH_FILE.write_text(json.dumps({"pid": os.getpid(), "session": session, "beat": time.time()}))
+    config.write_json(WATCH_FILE, {"pid": os.getpid(), "session": session, "beat": time.time()})
 
     address = cfg["address"]
     listener = Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.4)
@@ -323,7 +322,7 @@ def watch(cfg: dict, session: str | None) -> int:
         return live is not None and live.get("session") in (None, session)
 
     def capturing_now():
-        CAPTURE_FILE.write_text(str(time.time()))  # no progress update over the user
+        config.write_text_atomic(CAPTURE_FILE, str(time.time()))  # no progress update over the user
 
     try:
         while wanted():
@@ -400,10 +399,10 @@ def wait_for_capture(limit_s: float = 90) -> None:
 def turn(cfg: dict, text: str) -> str | None:
     """Speak `text`, then listen for the user's reply. Returns what they said, or None
     when the conversation is over (silence, or a sleep/exit phrase)."""
-    from .cli import is_exit_phrase, is_pause_phrase, is_sleep_phrase
-    from .ears import BargeIn, Listener, make_transcriber, is_noise
     import threading
 
+    from .cli import is_exit_phrase, is_pause_phrase, is_sleep_phrase
+    from .ears import BargeIn, Listener, is_noise, make_transcriber
     from .text import split_sentences
     from .voice import chime, make_speaker
 
