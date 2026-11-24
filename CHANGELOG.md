@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Faster `/jarvis:talk` turns.** Each turn used to load the voice (~2 s) and Whisper (~2 s) from scratch. Turns
+  now borrow both from the speech daemon, so Jarvis starts answering in about half a second, and talking over it
+  still works (the daemon reports how loud it's playing, so it can tell its own echo from you).
+- **`/jarvis:listen` is ready at once.** Whisper loads in the daemon while you're talking instead of before the
+  chime, and stays loaded for next time.
+- **Quicker mic start.** The room's noise level is remembered for ten minutes, so the mic is ready in about
+  0.15 s instead of 0.9 s.
+- The background listener during `/jarvis:talk` uses the daemon's Whisper too, and tells Jarvis's echo from your
+  voice better.
+- The daemon handles requests in parallel, so a transcription never delays a hush.
 - **`/jarvis:talk` stays in its own window.** The session you type it in owns the conversation; a busy second
   window can no longer take it over.
 - **Fewer misfires in `jarvis talk`.** "Shut down the dev server" or "make it start over" are requests now, not

@@ -258,12 +258,13 @@ def cmd_talk(args, cfg) -> int:
 # ----------------------------------------------------------------------------- listen / say
 def cmd_listen(args, cfg) -> int:
     """Record one spoken prompt and print its transcript (used by /jarvis:listen)."""
-    from .ears import Listener, is_noise, make_transcriber
+    from .ears import Listener, is_noise, make_fast_transcriber
     from .hooks import hush
     from .voice import chime
 
     hush()
-    transcriber = make_transcriber(cfg)
+    # Whisper loads in the speech daemon while you talk, instead of ~2 s before the chime.
+    transcriber = make_fast_transcriber(cfg)
     listener = Listener(cfg["silence"], args.max_seconds, cfg["sensitivity"], calibrate_s=0.8)
     chime("Tink", cfg, wait=True)  # finish the chime so it isn't recorded as speech
     print("Listening... speak now.", file=sys.stderr, flush=True)

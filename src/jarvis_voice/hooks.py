@@ -199,7 +199,7 @@ def on_stop() -> None:
         return
     if stopped:  # they asked Claude to stop: skip reading the reply, just listen
         text = ""
-    heard = converse.turn(cfg, text)
+    heard = converse.turn(cfg, text, session=data.get("session_id"))
     if heard is None:
         converse.end()
         return

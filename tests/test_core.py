@@ -187,7 +187,7 @@ def test_stop_hook_blocks_with_spoken_reply(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(_daemon, "request", lambda *a, **k: None)  # never touch the real daemon
     monkeypatch.delenv("JARVIS_VOICE_CHILD", raising=False)
     spoken = []
-    monkeypatch.setattr(converse, "turn", lambda cfg, text: spoken.append(text) or "what time is it")
+    monkeypatch.setattr(converse, "turn", lambda cfg, text, **kw: spoken.append(text) or "what time is it")
     monkeypatch.setattr(hooks, "_read_input", lambda: {"session_id": "s1", "last_assistant_message": "Done, sir."})
     converse.start()
     hooks.on_stop()
@@ -206,7 +206,7 @@ def test_stop_hook_blocks_with_spoken_reply(tmp_path, monkeypatch, capsys):
     assert "also add a test" in json.loads(capsys.readouterr().out)["reason"]
     assert spoken == ["Done, sir."]
 
-    monkeypatch.setattr(converse, "turn", lambda cfg, text: None)  # silence ends it
+    monkeypatch.setattr(converse, "turn", lambda cfg, text, **kw: None)  # silence ends it
     hooks.on_stop()
     assert capsys.readouterr().out == "" and not converse.is_on()
 
@@ -585,3 +585,129 @@ def test_doctor_runs_and_reports(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "voice model problem" in out and "jarvis setup" in out
     assert code == 1
+
+
+# ----------------------------------------------------------------------------- speed: daemon serves turns
+def test_daemon_append_queues_without_cutting_off():
+    fake = FakeSpeaker()
+    d = _daemon_with(fake)
+    d.say("First part.", "A", None)
+    assert _until(lambda: fake.said == ["First part."])
+    d.say("Second part.", "A", None, append=True)
+    _time.sleep(0.05)
+    assert not getattr(fake, "trimmed", False)  # not replaced
+    fake.release.set()
+    assert _until(lambda: fake.said == ["First part.", "Second part."])
+    d.stop()
+
+
+class _LevelSpeaker(FakeSpeaker):
+    def output_level(self, t):
+        return 0.25
+
+
+@pytest.fixture
+def live_daemon(monkeypatch):
+    import tempfile as tf
+    from pathlib import Path
+    tmp = tf.mkdtemp(prefix="jv")
+    monkeypatch.setattr(daemon, "SOCK", Path(tmp) / "s.sock")
+    monkeypatch.setattr(daemon, "LOCK", Path(tmp) / "s.lock")
+    monkeypatch.setattr(config, "CACHE_DIR", Path(tmp))
+    monkeypatch.setattr(config, "load", lambda: {**config.DEFAULTS})
+    fake = _LevelSpeaker()
+    calls = {"stt": 0, "voice": 0, "audio": None}
+
+    def ensure_speaker(self, idle_for):
+        calls["voice"] += 1
+        self.speaker = fake
+
+    def slow_stt(audio):
+        calls["audio"] = audio
+        _time.sleep(0.5)
+        return "turn left at the lights"
+
+    def ensure_stt(self):
+        calls["stt"] += 1
+        return slow_stt
+    monkeypatch.setattr(daemon.SpeechDaemon, "_ensure_speaker", ensure_speaker)
+    monkeypatch.setattr(daemon.SpeechDaemon, "_ensure_stt", ensure_stt)
+    t = threading.Thread(target=daemon.serve, daemon=True)
+    t.start()
+    assert _until(lambda: daemon.running())
+    yield fake, calls
+    daemon.request("quit")
+    t.join(3)
+
+
+def test_daemon_transcribes_without_blocking_other_requests(live_daemon):
+    fake, calls = live_daemon
+    audio = np.linspace(-0.5, 0.5, 16000, dtype=np.float32)
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("text", daemon.transcribe(audio)))
+    worker.start()
+    _time.sleep(0.1)  # transcription under way...
+    t0 = _time.monotonic()
+    assert daemon.request("status") is not None
+    assert _time.monotonic() - t0 < 0.2  # ...and a status/hush still answers at once
+    worker.join(3)
+    assert result["text"] == "turn left at the lights"
+    assert np.array_equal(calls["audio"], audio)
+
+
+def test_daemon_reports_playback_level_and_warms_up(live_daemon):
+    fake, calls = live_daemon
+    assert daemon.level(_time.monotonic()) == 0.0  # silent
+    daemon.speak("Hello there.", session="A")
+    assert _until(lambda: fake.said == ["Hello there."])
+    assert daemon.level(_time.monotonic()) == 0.25
+    fake.release.set()
+    daemon.warm(stt=True)
+    assert _until(lambda: calls["stt"] == 1)
+
+
+def test_daemon_speaker_waits_and_stops(live_daemon):
+    fake, _ = live_daemon
+    sp = daemon.DaemonSpeaker("A")
+    sp.say("One. Two.")
+    assert sp.busy.is_set()
+    assert _until(lambda: fake.said == ["One. ", "Two."])  # the daemon split it into sentences
+    fake.release.set()
+    done = threading.Thread(target=sp.wait)
+    done.start()
+    done.join(3)
+    assert not done.is_alive() and not sp.busy.is_set()
+    sp.close()
+
+
+def test_fast_transcriber_falls_back_to_local_whisper(monkeypatch):
+    from jarvis_voice import ears
+    monkeypatch.setattr(daemon, "warm", lambda stt=False: None)
+    monkeypatch.setattr(daemon, "transcribe", lambda audio, timeout=90.0: None)
+    monkeypatch.setattr(daemon, "running", lambda: False)
+    loads = []
+    monkeypatch.setattr(ears, "make_transcriber", lambda cfg: loads.append(1) or (lambda a: "local text"))
+    ft = ears.make_fast_transcriber({**config.DEFAULTS})
+    ft.t0 -= 60  # long past start-up: don't wait for a daemon that isn't coming
+    assert ft(np.zeros(10, np.float32)) == "local text"
+    assert ft(np.zeros(10, np.float32)) == "local text" and loads == [1]  # loaded once
+
+
+def test_noise_level_is_remembered_between_turns(tmp_path, monkeypatch):
+    import queue as _queue
+
+    from jarvis_voice import ears
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    assert ears._noise_hint() is None
+    ears._save_noise(0.004)
+    assert ears._noise_hint() == 0.004
+    lst = ears.Listener.__new__(ears.Listener)
+    lst.q, lst.enabled, lst.sensitivity = _queue.Queue(), threading.Event(), 3.0
+    for f in _frames(0.002, 5):
+        lst.q.put((0.0, f))
+    t0 = _time.monotonic()
+    threshold = lst._calibrate(1.0, hint=0.004)
+    assert _time.monotonic() - t0 < 0.4  # short check instead of ~1.3 s
+    assert lst.noise == 0.004 and abs(threshold - 0.012) < 1e-9
+    config.write_json(tmp_path / "noise.json", {"noise": 0.004, "at": _time.time() - 3600})
+    assert ears._noise_hint() is None  # stale: measure properly

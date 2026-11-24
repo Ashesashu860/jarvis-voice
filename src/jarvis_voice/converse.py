@@ -283,17 +283,22 @@ class _DaemonVoice:
                 self.busy.clear()
             time.sleep(0.15)
 
+    def output_level(self, t: float) -> float | None:
+        """Playback loudness from the daemon, so BargeIn can learn our own echo
+        instead of falling back to a high fixed threshold."""
+        from . import daemon
+        return daemon.level(t)
+
 
 def watch(cfg: dict, session: str | None) -> int:
     """The background listener (`jarvis watch`). Runs until stopped, the conversation
     ends, or Claude has been idle for WATCH_IDLE_S."""
     import fcntl
     import os
-    import threading
 
     from . import daemon
     from .cli import is_pause_phrase
-    from .ears import BargeIn, Listener, is_noise, make_transcriber
+    from .ears import BargeIn, Listener, is_noise, make_fast_transcriber
     from .voice import chime
 
     config.CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -308,9 +313,7 @@ def watch(cfg: dict, session: str | None) -> int:
     listener = Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.4)
     listener.start_continuous()
     voice = _DaemonVoice()
-    model: dict = {}
-    loader = threading.Thread(target=lambda: model.setdefault("t", make_transcriber(cfg)), daemon=True)
-    loader.start()
+    transcriber = make_fast_transcriber(cfg)
 
     def wanted() -> bool:
         st = _watch_state()
@@ -345,8 +348,7 @@ def watch(cfg: dict, session: str | None) -> int:
                 if audio is None:
                     continue
                 chime("Pop", cfg)
-                loader.join()
-                heard = model["t"](audio)
+                heard = transcriber(audio)
                 if not heard or is_noise(heard) or is_echo(heard, voice.recent):
                     continue
                 if is_stop_task(heard) or (not barged and is_pause_phrase(heard)):
@@ -396,28 +398,20 @@ def wait_for_capture(limit_s: float = 90) -> None:
 
 
 # ----------------------------------------------------------------------------- one turn
-def turn(cfg: dict, text: str) -> str | None:
-    """Speak `text`, then listen for the user's reply. Returns what they said, or None
-    when the conversation is over (silence, or a sleep/exit phrase)."""
+def _open_turn_local(cfg: dict):
+    """Speaker, listener and transcriber loaded in this process (speech daemon off):
+    about 4 s of model loading per turn, partly hidden by doing it in parallel."""
     import threading
 
-    from .cli import is_exit_phrase, is_pause_phrase, is_sleep_phrase
-    from .ears import BargeIn, Listener, is_noise, make_transcriber
-    from .text import split_sentences
-    from .voice import chime, make_speaker
+    from .ears import Listener, make_transcriber
+    from .voice import make_speaker
 
-    address = cfg["address"]
-    # Start-up used to run in series (voice ~1.4 s, mic calibration ~1 s, Whisper ~1.2 s)
-    # before the first word. Calibrate the mic while the voice loads, and load Whisper
-    # in the background while Jarvis is talking.
     mic: dict = {}
     calib = threading.Thread(target=lambda: mic.setdefault(
         "l", Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.6)), daemon=True)
     calib.start()
     speaker = make_speaker(cfg)
     calib.join()
-    listener = mic["l"]
-    listener.start_continuous()
     model: dict = {}
     loader = threading.Thread(target=lambda: model.setdefault("t", make_transcriber(cfg)), daemon=True)
     loader.start()
@@ -425,14 +419,45 @@ def turn(cfg: dict, text: str) -> str | None:
     def transcriber(audio):
         loader.join()
         return model["t"](audio)
+    return speaker, mic["l"], transcriber
+
+
+def _open_turn_daemon(cfg: dict, session: str | None):
+    """Speaker and transcriber borrowed from the speech daemon, whose models are
+    already loaded: the reply starts in well under a second instead of ~3 s."""
+    from .daemon import DaemonSpeaker
+    from .ears import Listener, make_fast_transcriber
+
+    transcriber = make_fast_transcriber(cfg)  # first, so the daemon warms up meanwhile
+    listener = Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.6)
+    return DaemonSpeaker(session), listener, transcriber
+
+
+def turn(cfg: dict, text: str, session: str | None = None) -> str | None:
+    """Speak `text`, then listen for the user's reply. Returns what they said, or None
+    when the conversation is over (silence, or a sleep/exit phrase)."""
+    from .cli import is_exit_phrase, is_pause_phrase, is_sleep_phrase
+    from .ears import BargeIn, is_noise
+    from .text import split_sentences
+    from .voice import chime
+
+    address = cfg["address"]
+    if cfg.get("speech_daemon", True):
+        speaker, listener, transcriber = _open_turn_daemon(cfg, session)
+    else:
+        speaker, listener, transcriber = _open_turn_local(cfg)
+    listener.start_continuous()
 
     def say(line: str) -> None:
         speaker.say(line)
         speaker.wait()
 
     def speak_all() -> None:
-        for s in split_sentences(text):  # sentence by sentence: the first plays while the rest render
-            speaker.say(s)
+        if getattr(speaker, "splits_itself", False):
+            speaker.say(text)
+        else:
+            for s in split_sentences(text):  # sentence by sentence: the first plays while the rest render
+                speaker.say(s)
         speaker.wait()
 
     barged = None
@@ -478,6 +503,7 @@ def turn(cfg: dict, text: str) -> str | None:
             return heard
     finally:
         speaker.stop()
+        getattr(speaker, "close", lambda: None)()
         listener.close()
 
 

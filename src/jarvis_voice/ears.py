@@ -78,7 +78,7 @@ class Listener:
     """Captures one utterance at a time from the default microphone."""
 
     def __init__(self, silence_s: float = 1.0, max_s: float = 30.0, sensitivity: float = 3.0,
-                 calibrate_s: float = 1.0):
+                 calibrate_s: float = 1.0, noise_cache: bool = True):
         import sounddevice as sd
         self.silence_frames = int(silence_s * 1000 / FRAME_MS)
         self.max_frames = int(max_s * 1000 / FRAME_MS)
@@ -90,7 +90,9 @@ class Listener:
         self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                                      blocksize=FRAME_LEN, callback=self._cb)
         self.stream.start()
-        self.threshold = self._calibrate(calibrate_s)
+        self.noise_cache = noise_cache
+        hint = _noise_hint() if noise_cache else None
+        self.threshold = self._calibrate(calibrate_s, hint)
 
     def start_continuous(self):
         """Keep recording between listen() calls, so speech that starts while the
@@ -105,6 +107,8 @@ class Listener:
     def close(self):
         self.stream.stop()
         self.stream.close()
+        if self.noise_cache:
+            _save_noise(self.noise)
 
     def _cb(self, indata, frames, t, status):
         if self.enabled.is_set():
@@ -117,19 +121,29 @@ class Listener:
         except queue.Empty:
             pass
 
-    def _calibrate(self, seconds: float) -> float:
-        time.sleep(0.3)  # the first frames after opening a mic are often near-silent
+    def _calibrate(self, seconds: float, hint: float | None = None) -> float:
+        """Measure the room's background level. With a recent measurement (`hint`) a
+        short check is enough: it only has to catch the room having got louder, and
+        listen() keeps adapting to it anyway."""
+        if hint is not None:
+            seconds = min(seconds, HINT_CALIBRATE_S)
+        else:
+            time.sleep(0.3)  # the first frames after opening a mic are often near-silent
         self.enabled.set()
         levels = []
         end = time.time() + seconds
-        while time.time() < end:
+        while (left := end - time.time()) > 0:
             try:
-                levels.append(rms(self.q.get(timeout=0.5)[1]))
+                levels.append(rms(self.q.get(timeout=min(0.5, left))[1]))
             except queue.Empty:
                 break
         self.enabled.clear()
         self._drain()
-        self.noise = float(np.percentile(levels, 75)) if levels else 0.005
+        measured = float(np.percentile(levels, 75)) if levels else None
+        if hint is not None:
+            self.noise = max(hint, measured or 0.0)
+        else:
+            self.noise = measured if measured is not None else 0.005
         return max(self.noise * self.sensitivity, 0.008)
 
     def listen(self, start_timeout: float | None = None,
@@ -180,6 +194,35 @@ class Listener:
         if len(frames) < 12:  # < ~0.35 s: a click, not speech
             return None
         return np.concatenate(frames)
+
+
+# The room's noise level is remembered between turns, saving ~0.7 s of calibration.
+HINT_TTL_S = 10 * 60
+HINT_CALIBRATE_S = 0.15
+
+
+def _noise_file():
+    from . import config
+    return config.CACHE_DIR / "noise.json"
+
+
+def _noise_hint() -> float | None:
+    import json
+    try:
+        st = json.loads(_noise_file().read_text())
+        if time.time() - st["at"] < HINT_TTL_S and 0 < st["noise"] < 1:
+            return float(st["noise"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _save_noise(noise: float) -> None:
+    from . import config
+    try:
+        config.write_json(_noise_file(), {"noise": float(noise), "at": time.time()})
+    except OSError:
+        pass
 
 
 class BargeIn:
@@ -304,3 +347,48 @@ class Transcriber:
 
 def make_transcriber(cfg: dict) -> Transcriber:
     return Transcriber(cfg["whisper"], cfg.get("vocabulary", ""))
+
+
+DAEMON_BOOT_S = 6.0
+
+
+class FastTranscriber:
+    """Transcribes with the speech daemon's already-loaded Whisper (asking it to load
+    now, so it's ready by the time you stop talking). Falls back to loading Whisper in
+    this process if the daemon is off or unavailable."""
+
+    def __init__(self, cfg: dict):
+        self.cfg, self.local = cfg, None
+        self.use_daemon = bool(cfg.get("speech_daemon", True))
+        self.t0 = time.time()
+        if self.use_daemon:
+            from . import daemon
+            daemon.warm(stt=True)
+
+    def __call__(self, audio: np.ndarray) -> str:
+        if self.use_daemon:
+            from . import daemon
+            text = daemon.transcribe(audio)
+            # A daemon we just started takes a few seconds to come up; don't wait longer than that.
+            boot_left = DAEMON_BOOT_S - (time.time() - self.t0)
+            if text is None and boot_left > 0 and _wait_for(daemon.running, boot_left):
+                text = daemon.transcribe(audio)
+            if text is not None:
+                return text
+            self.use_daemon = False  # don't wait on it again this time
+        if self.local is None:
+            self.local = make_transcriber(self.cfg)
+        return self.local(audio)
+
+
+def _wait_for(check, limit_s: float) -> bool:
+    end = time.time() + limit_s
+    while time.time() < end:
+        if check():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def make_fast_transcriber(cfg: dict):
+    return FastTranscriber(cfg)

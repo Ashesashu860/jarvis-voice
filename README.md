@@ -134,8 +134,8 @@ Stored in `~/.config/jarvis-voice/config.json`. Change them with `jarvis config 
 | `chimes` | `true` | Listening and heard sounds |
 | `narrate` | `true` | Speak progress updates while Claude works |
 | `converse_timeout` | `60` | `/jarvis:talk`: seconds of silence before the conversation ends |
-| `speech_daemon` | `true` | Keep the voice loaded in a background process so replies start in well under a second |
-| `daemon_idle_minutes` | `30` | The background voice exits after this long unused, freeing its ~600 MB |
+| `speech_daemon` | `true` | Keep the voice and speech recognition loaded in a background process, so replies, `/jarvis:talk` turns and `/jarvis:listen` start in well under a second |
+| `daemon_idle_minutes` | `30` | The background process exits after this long unused, freeing its memory (~600 MB for the voice, plus ~150–500 MB for Whisper once used) |
 
 ## How the voice is made
 
