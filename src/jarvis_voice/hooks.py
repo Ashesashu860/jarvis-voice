@@ -30,9 +30,9 @@ def _active(cfg: dict) -> bool:
 
 
 # ----------------------------------------------------------------------------- speaking process control
-# Plain replies and updates go to the speech daemon (fast, session-aware). Updates spoken
-# during a /jarvis:talk conversation also listen for the user, so they run in their own
-# process, tracked by PID_FILE as {"pid": ..., "session": ...}.
+# Replies and updates go to the speech daemon (fast, session-aware). With the daemon
+# turned off, each runs in its own process, tracked by PID_FILE as {"pid": ..., "session": ...}.
+# During /jarvis:talk a separate watcher process listens while Claude works (converse.watch).
 NARRATION_TTL_S = 15.0  # a progress update that can't start this soon is dropped
 
 
@@ -67,11 +67,9 @@ def hush(session: str | None = None) -> None:
         pass
 
 
-def speak_detached(text: str, listen: bool = False, session: str | None = None,
-                   ttl: float | None = None) -> None:
-    """Speak `text` without blocking the hook. With `listen`, it also hears the user
-    talking over it (see converse.speak_listening)."""
-    if not listen and config.load()["speech_daemon"]:
+def speak_detached(text: str, session: str | None = None, ttl: float | None = None) -> None:
+    """Speak `text` without blocking the hook."""
+    if config.load()["speech_daemon"]:
         from . import daemon
         pid, owner = _speaker_proc()
         if pid is not None and owner in (None, session):
@@ -84,8 +82,6 @@ def speak_detached(text: str, listen: bool = False, session: str | None = None,
     with os.fdopen(fd, "w") as f:
         f.write(text)
     cmd = [sys.executable, "-m", "jarvis_voice", "say", "--file", path, "--delete"]
-    if listen:
-        cmd.append("--listen")
     proc = subprocess.Popen(cmd,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
@@ -101,34 +97,53 @@ def _text_of(content) -> str:
     return ""
 
 
+def _lines_backwards(path: str, chunk: int = 1 << 16):
+    """Yield a file's lines last-first, reading from the end in chunks, so the cost
+    depends on how far back we look rather than on how long the transcript is."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos, tail = f.tell(), b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            f.seek(pos)
+            parts = (f.read(step) + tail).split(b"\n")
+            tail = parts.pop(0)  # may be cut off: complete it with the next chunk
+            for line in reversed(parts):
+                if line.strip():
+                    yield line.decode("utf-8", "replace")
+        if tail.strip():
+            yield tail.decode("utf-8", "replace")
+
+
 def last_reply_from_transcript(path: str) -> str:
-    """Assistant text written since the user's last real prompt."""
-    texts: list[str] = []
+    """The latest assistant text written since the user's last real prompt.
+
+    Called on every tool use, so it scans from the end of the transcript and stops at
+    the first answer (or at the user's prompt) instead of parsing the whole file."""
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if entry.get("isSidechain"):
-                    continue
-                kind = entry.get("type")
-                msg = entry.get("message") or {}
-                if kind == "user":
-                    content = msg.get("content")
-                    is_tool_result = isinstance(content, list) and any(
-                        isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
-                    if not is_tool_result and not entry.get("isMeta"):
-                        texts = []
-                elif kind == "assistant":
-                    t = _text_of(msg.get("content"))
-                    if t.strip():
-                        texts.append(t)
+        for line in _lines_backwards(path):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("isSidechain"):
+                continue
+            kind = entry.get("type")
+            msg = entry.get("message") or {}
+            if kind == "user":
+                content = msg.get("content")
+                is_tool_result = isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+                if not is_tool_result and not entry.get("isMeta"):
+                    return ""  # reached the user's prompt: nothing said since
+            elif kind == "assistant":
+                t = _text_of(msg.get("content"))
+                if t.strip():
+                    return t  # the final text block is the answer
     except OSError:
         return ""
-    # The final text block is the answer; earlier ones are mid-task narration.
-    return texts[-1] if texts else ""
+    return ""
 
 
 def spoken_excerpt(reply: str, max_chars: int) -> str:
@@ -166,13 +181,20 @@ def on_stop() -> None:
             speak_detached(text, session=data.get("session_id"))
         return
     # Conversation mode: speak, listen, and hand the user's reply straight back to Claude.
-    converse.wait_for_capture()  # let a progress update finish catching what they said
+    from . import daemon
+    converse.wait_for_capture()  # let the watcher finish catching what they said
+    converse.stop_watcher()      # the turn below opens the mic itself
+    stopped = converse.halted(data.get("session_id"))
+    converse.clear_halt()
+    daemon.settle()              # finish the sentence being said, then go quiet
     hush()
     pending = converse.pop_all()
     if pending:  # they spoke over a progress update and Claude hasn't seen it yet
         print(json.dumps({"decision": "block",
                           "reason": converse.continuation(" ".join(pending), cfg["address"])}))
         return
+    if stopped:  # they asked Claude to stop: skip reading the reply, just listen
+        text = ""
     heard = converse.turn(cfg, text)
     if heard is None:
         converse.end()
@@ -184,7 +206,9 @@ def on_prompt() -> None:
     data = _read_input()
     hush(data.get("session_id"))  # you started typing here: this session's Jarvis stops
     cfg = config.load()
-    from .converse import is_on
+    from .converse import TALK_COMMAND, is_on, note_owner
+    if TALK_COMMAND.match(data.get("prompt") or "") and not os.environ.get("JARVIS_VOICE_CHILD"):
+        note_owner(data.get("session_id"))  # this window owns the conversation
     voiced = _active(cfg) or (is_on() and not os.environ.get("JARVIS_VOICE_CHILD"))
     if voiced and cfg["persona_in_claude_code"]:
         print(json.dumps({"hookSpecificOutput": {
@@ -266,10 +290,24 @@ def on_tool() -> None:
     conversing = converse.claim(data.get("session_id"))
     if not (cfg["speak_replies"] or conversing):
         return
+    session = data.get("session_id")
+    if conversing:
+        stop_text = converse.halted(session)
+        if stop_text:  # the user said "stop" while Claude was working
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"The user said aloud \"{stop_text}\" (voice conversation): they want you to stop "
+                    "this task now. Do not call any more tools. End your turn with one short "
+                    "sentence saying where you stopped."),
+            }}))
+            return
+        if cfg["listen_while_working"]:
+            converse.ensure_watcher(session)
     if converse.capturing():  # the user is talking to us: don't speak over them
         return
     states = _narrate_states()
-    session = data.get("session_id")
     st = states.setdefault(str(session), {})
     now = time.time()
 
@@ -286,8 +324,7 @@ def on_tool() -> None:
     st["tool_at"] = st["seen"] = now
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     NARRATE_FILE.write_text(json.dumps(states))
-    # In a conversation, keep the mic open while speaking so the user can cut in.
-    speak_detached(line, listen=conversing, session=session, ttl=None if conversing else NARRATION_TTL_S)
+    speak_detached(line, session=session, ttl=NARRATION_TTL_S)
 
 
 def on_tool_done() -> None:
@@ -297,6 +334,7 @@ def on_tool_done() -> None:
     data = _read_input()
     if os.environ.get("JARVIS_VOICE_CHILD") or not converse.claim(data.get("session_id")):
         return
+    converse.heartbeat()  # a long task is still going: keep the watcher listening
     pending = converse.pop_all()
     if pending:
         print(json.dumps({"hookSpecificOutput": {
@@ -305,9 +343,25 @@ def on_tool_done() -> None:
         }}))
 
 
+def _protect_stdout() -> None:
+    """Claude Code parses a hook's stdout as JSON. C libraries (PortAudio prints
+    "||PaMacCore (AUHAL)|| Error ..." when playback is cut off) write to fd 1 directly,
+    which would corrupt it and silently drop the decision. Point fd 1 at stderr and
+    give Python's print() a private copy of the real stdout."""
+    try:
+        real = os.dup(1)
+        os.dup2(2, 1)
+        sys.stdout = os.fdopen(real, "w", buffering=1)
+    except OSError:
+        pass
+
+
 def run(event: str) -> int:
+    _protect_stdout()
     try:
         {"stop": on_stop, "prompt": on_prompt, "tool": on_tool, "tool-done": on_tool_done}[event]()
     except Exception as e:  # never break the user's Claude Code session
         print(f"jarvis hook {event}: {type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        sys.stdout.flush()
     return 0

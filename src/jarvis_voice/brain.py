@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
+import threading
 
 from .text import SENTENCE_END
 
 C_DIM, C_CYAN, C_YEL, C_RST = "\033[2m", "\033[36m", "\033[33m", "\033[0m"
+KILL_AFTER_S = 2.0  # cancel(): SIGKILL if claude hasn't exited this long after SIGTERM
 
 STYLE = (
     "Personality: calm, precise, unfailingly polite, with a dry, understated British wit. Speak like a "
@@ -75,10 +79,19 @@ class Brain:
             cmd += ["--allowedTools", *self.tools.split(",")]
 
         # JARVIS_VOICE_CHILD stops the Claude Code plugin hooks from also speaking this session.
-        import os
         env = {**os.environ, "JARVIS_VOICE_CHILD": "1"}
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        # stderr goes to a temp file, not a pipe: a pipe nobody reads until the end fills
+        # up (~64 KB) and then both processes block forever.
+        errf = tempfile.TemporaryFile(mode="w+")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
                                      text=True, cwd=self.cwd, bufsize=1, env=env)
+        try:
+            self._stream(speaker, errf)
+        finally:
+            errf.close()
+            self.proc = None
+
+    def _stream(self, speaker, errf) -> None:
         buf, said_wait, full = "", False, []
         print(f"{C_CYAN}JARVIS:{C_RST} ", end="", flush=True)
         for line in self.proc.stdout:
@@ -120,10 +133,10 @@ class Brain:
         if self.cancelled:
             print(f"{C_DIM} [cut short]{C_RST}", end="")
         elif self.proc.returncode and not full:
-            err = self.proc.stderr.read().strip()
+            errf.seek(0)
+            err = errf.read().strip()
             print(f"{C_YEL}claude exited {self.proc.returncode}: {err[:400]}{C_RST}")
             speaker.say("I'm afraid I couldn't reach my brain just now.")
-        self.proc = None
         print()
 
     def cancel(self):
@@ -131,3 +144,5 @@ class Brain:
         proc = self.proc
         if proc and proc.poll() is None:
             proc.terminate()
+            # Don't block the caller (often the barge-in thread); force it if it lingers.
+            threading.Timer(KILL_AFTER_S, lambda: proc.poll() is None and proc.kill()).start()

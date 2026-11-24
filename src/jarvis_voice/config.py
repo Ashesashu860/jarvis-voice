@@ -24,6 +24,9 @@ DEFAULTS: dict = {
     "wake": True,                  # jarvis talk: wait for "Hey Jarvis" (False = always listening)
     "wake_timeout": 10.0,          # seconds of silence before going back to standby
     "whisper": "base.en",
+    # comma-separated names/jargon Whisper should spell right
+    "vocabulary": "Jarvis, Claude, Claude Code, Next.js, React, TypeScript, JavaScript, Python, Flutter, GitHub, npm",
+    "listen_while_working": True,  # /jarvis:talk: keep listening while Claude works, so you can cut in
     "silence": 1.0,
     "sensitivity": 3.0,
     "converse_timeout": 60.0,      # /jarvis:talk: seconds of silence before the conversation ends

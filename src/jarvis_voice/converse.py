@@ -8,6 +8,7 @@ and the session goes back to normal typing."""
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from . import config
@@ -19,12 +20,15 @@ STALE_S = 6 * 3600  # an armed conversation nobody claimed for this long is forg
 # ----------------------------------------------------------------------------- state
 def start() -> None:
     """Arm conversation mode; the next Claude Code session to finish a reply claims it."""
+    stop_watcher()
+    clear_halt()
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"session": None, "since": time.time()}))
+    _write_json(STATE_FILE, {"session": _owner_hint(), "since": time.time()})
 
 
 def end() -> None:
-    for f in (STATE_FILE, INBOX_FILE):
+    stop_watcher()
+    for f in (STATE_FILE, INBOX_FILE, HALT_FILE, OWNER_FILE):
         try:
             f.unlink()
         except FileNotFoundError:
@@ -47,15 +51,59 @@ def _state() -> dict | None:
 
 
 def claim(session_id: str | None) -> bool:
-    """True if conversation mode belongs to this session (claiming it if unclaimed)."""
+    """True if conversation mode belongs to this session (claiming it if unclaimed).
+
+    An unclaimed conversation goes only to the session the user typed /jarvis:talk in
+    (see `note_owner`), so a busy second window's tool hooks can't take it over."""
     st = _state()
     if st is None:
         return False
     if st.get("session") is None:
+        owner = _owner_hint()
+        if owner is not None and owner != session_id:
+            return False
         st["session"] = session_id
-        STATE_FILE.write_text(json.dumps(st))
+        _write_json(STATE_FILE, st)
         return True
     return st["session"] == session_id
+
+
+# The UserPromptSubmit hook sees which session /jarvis:talk was typed in; the command's
+# own `jarvis converse` doesn't. Either may run first, so both sides check this hint.
+OWNER_FILE = config.CACHE_DIR / "converse-owner.json"
+OWNER_TTL_S = 120.0
+TALK_COMMAND = re.compile(r"^\s*/(?:jarvis:)?talk\b")
+
+
+def note_owner(session_id: str | None) -> None:
+    """Record that /jarvis:talk was typed in this session, and claim an unclaimed
+    conversation for it straight away."""
+    if not session_id:
+        return
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _write_json(OWNER_FILE, {"session": session_id, "at": time.time()})
+    st = _state()
+    if st is not None and st.get("session") is None:
+        st["session"] = session_id
+        _write_json(STATE_FILE, st)
+
+
+def _owner_hint() -> str | None:
+    try:
+        st = json.loads(OWNER_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if time.time() - st.get("at", 0) > OWNER_TTL_S:
+        return None
+    return st.get("session")
+
+
+def _write_json(path, data) -> None:
+    """Write atomically, so a hook in another process never reads half a file."""
+    import os
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, path)
 
 
 # ----------------------------------------------------------------------------- inbox
@@ -95,39 +143,233 @@ def interjection(texts: list[str], address: str) -> str:
     )
 
 
-def speak_listening(cfg: dict, text: str) -> None:
-    """Speak `text` (a progress update) while listening; if the user talks over it,
-    stop, catch what they say and leave it in the inbox for Claude."""
-    from .cli import is_pause_phrase
-    from .ears import BargeIn, Listener, Transcriber, is_noise
-    from .voice import chime, make_speaker, split_sentences
+# ----------------------------------------------------------------------------- listening while Claude works
+# While Claude works on a spoken request, a background "watcher" process keeps the mic
+# open. Anything the user says goes to the inbox (handed to Claude by the next tool hook);
+# "stop" / "cancel" sets a halt that makes the tool hooks refuse further tools, so Claude
+# wraps up and the conversation goes back to listening.
+WATCH_FILE = config.CACHE_DIR / "watch.json"
+WATCH_LOCK = config.CACHE_DIR / "watch.lock"
+HALT_FILE = config.CACHE_DIR / "halt.json"
+WATCH_IDLE_S = 15 * 60  # no tool activity for this long: the watcher gives up
 
-    speaker = make_speaker(cfg)
+# Said while Claude works, these mean "stop the task" (plain "stop"/"wait" only do when
+# Jarvis isn't talking; over Jarvis they just mean "stop talking").
+STOP_TASK_PHRASES = (
+    "stop the task", "stop that", "stop it", "stop working", "stop everything", "stop all",
+    "stop what youre doing", "stop doing that", "cancel", "cancel that", "cancel it",
+    "cancel the task", "abort", "abort that", "abort it", "halt", "never mind stop",
+)
+
+
+def is_stop_task(text: str) -> bool:
+    from .ears import normalize
+    n = normalize(text)
+    for filler in ("jarvis ", "ok ", "okay ", "no ", "please ", "hey jarvis "):
+        n = n.removeprefix(filler)
+    n = n.removesuffix(" please").removesuffix(" jarvis").removesuffix(" now").strip()
+    return n in STOP_TASK_PHRASES
+
+
+def is_echo(heard: str, recent: list[str]) -> bool:
+    """Did the mic just pick up Jarvis's own voice rather than the user?"""
+    from .ears import normalize
+    words = normalize(heard).split()
+    if not words:
+        return False
+    for said in recent:
+        spoken = set(normalize(said).split())
+        if spoken and sum(w in spoken for w in words) >= 0.7 * len(words):
+            return True
+    return False
+
+
+def halt(session: str | None, text: str) -> None:
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    HALT_FILE.write_text(json.dumps({"session": session, "text": text, "at": time.time()}))
+
+
+def halted(session: str | None) -> str | None:
+    """What the user said to stop this session's task, if they did."""
+    try:
+        st = json.loads(HALT_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if st.get("session") not in (None, session):
+        return None
+    return st.get("text") or "stop"
+
+
+def clear_halt() -> None:
+    try:
+        HALT_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _watch_state() -> dict | None:
+    try:
+        return json.loads(WATCH_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def ensure_watcher(session: str | None) -> None:
+    """Start the background listener for this session unless it's already running."""
+    import subprocess
+    import sys
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    st = _watch_state()
+    if st and st.get("session") == session and _alive(int(st.get("pid", 0))):
+        WATCH_FILE.write_text(json.dumps({**st, "beat": time.time()}))
+        return
+    cmd = [sys.executable, "-m", "jarvis_voice", "watch"] + (["--session", session] if session else [])
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def heartbeat() -> None:
+    st = _watch_state()
+    if st:
+        WATCH_FILE.write_text(json.dumps({**st, "beat": time.time()}))
+
+
+def stop_watcher() -> None:
+    import os
+    import signal
+    st = _watch_state()
+    if st and st.get("pid"):
+        try:
+            os.kill(int(st["pid"]), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        end = time.time() + 2
+        while _alive(int(st["pid"])) and time.time() < end:
+            time.sleep(0.05)
+    try:
+        WATCH_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+class _DaemonVoice:
+    """Stands in for a speaker in BargeIn: `busy` mirrors whether the speech daemon is
+    talking (polled), and `recent` holds what it said lately."""
+
+    def __init__(self):
+        import threading
+        self.busy = threading.Event()
+        self.recent: list[str] = []
+        threading.Thread(target=self._poll, daemon=True).start()
+
+    def _poll(self):
+        from . import daemon
+        while True:
+            st = daemon.request("status", timeout=0.3) or {}
+            self.recent = st.get("recent") or []
+            if st.get("busy") or st.get("queued"):
+                self.busy.set()
+            else:
+                self.busy.clear()
+            time.sleep(0.15)
+
+
+def watch(cfg: dict, session: str | None) -> int:
+    """The background listener (`jarvis watch`). Runs until stopped, the conversation
+    ends, or Claude has been idle for WATCH_IDLE_S."""
+    import fcntl
+    import os
+    import threading
+
+    from . import daemon
+    from .cli import is_pause_phrase
+    from .ears import BargeIn, Listener, is_noise, make_transcriber
+    from .voice import chime
+
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(WATCH_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # another watcher is already listening
+    WATCH_FILE.write_text(json.dumps({"pid": os.getpid(), "session": session, "beat": time.time()}))
+
+    address = cfg["address"]
     listener = Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.4)
     listener.start_continuous()
+    voice = _DaemonVoice()
+    model: dict = {}
+    loader = threading.Thread(target=lambda: model.setdefault("t", make_transcriber(cfg)), daemon=True)
+    loader.start()
+
+    def wanted() -> bool:
+        st = _watch_state()
+        if not st or st.get("pid") != os.getpid():
+            return False
+        if time.time() - st.get("beat", 0) > WATCH_IDLE_S:
+            return False
+        live = _state()
+        return live is not None and live.get("session") in (None, session)
+
+    def capturing_now():
+        CAPTURE_FILE.write_text(str(time.time()))  # no progress update over the user
+
     try:
-        barge = BargeIn(listener, speaker, speaker.stop)
-        with barge.watch():
-            for s in split_sentences(text):
-                speaker.say(s)
-            speaker.wait()
-        if not barge.triggered:
-            return
-        speaker.stop()
-        CAPTURE_FILE.write_text(str(time.time()))  # don't let the next update cut us off
-        audio = listener.listen(prefix=barge.captured)
-        if audio is None:
-            return
-        chime("Pop", cfg)
-        heard = Transcriber(cfg["whisper"])(audio)
-        if heard and not is_noise(heard) and not is_pause_phrase(heard):
-            push(heard)
-            speaker.say(f"Noted, {cfg['address']}.")
-            speaker.wait()
+        while wanted():
+            barged = False
+            if voice.busy.is_set():
+                barge = BargeIn(listener, voice, lambda: daemon.request("hush", session=None))
+                with barge.watch():
+                    while voice.busy.is_set() and not barge.triggered:
+                        time.sleep(0.05)
+                if not barge.triggered:
+                    continue
+                barged = True
+                capturing_now()
+                audio = listener.listen(prefix=barge.captured)
+            else:
+                audio = listener.listen(start_timeout=0.5, on_start=capturing_now)
+                if audio is None and listener.timed_out:
+                    continue
+            try:
+                if audio is None:
+                    continue
+                chime("Pop", cfg)
+                loader.join()
+                heard = model["t"](audio)
+                if not heard or is_noise(heard) or is_echo(heard, voice.recent):
+                    continue
+                if is_stop_task(heard) or (not barged and is_pause_phrase(heard)):
+                    halt(session, heard)
+                    daemon.speak(f"Stopping, {address}.", session=session)
+                elif barged and is_pause_phrase(heard):
+                    continue  # "stop talking": silence was all they wanted
+                else:
+                    push(heard)
+                    daemon.speak(f"Noted, {address}.", session=session)
+            finally:
+                capture_done()
+                listener.flush()
     finally:
-        speaker.stop()
         listener.close()
-        capture_done()
+        st = _watch_state()
+        if st and st.get("pid") == os.getpid():
+            try:
+                WATCH_FILE.unlink()
+            except FileNotFoundError:
+                pass
+    return 0
 
 
 CAPTURE_FILE = config.CACHE_DIR / "capturing"
@@ -158,18 +400,40 @@ def wait_for_capture(limit_s: float = 90) -> None:
 def turn(cfg: dict, text: str) -> str | None:
     """Speak `text`, then listen for the user's reply. Returns what they said, or None
     when the conversation is over (silence, or a sleep/exit phrase)."""
-    from .cli import EXIT_PHRASES, is_pause_phrase, is_sleep_phrase
-    from .ears import BargeIn, Listener, Transcriber, is_noise, normalize
+    from .cli import is_exit_phrase, is_pause_phrase, is_sleep_phrase
+    from .ears import BargeIn, Listener, make_transcriber, is_noise
+    import threading
+
+    from .text import split_sentences
     from .voice import chime, make_speaker
 
     address = cfg["address"]
+    # Start-up used to run in series (voice ~1.4 s, mic calibration ~1 s, Whisper ~1.2 s)
+    # before the first word. Calibrate the mic while the voice loads, and load Whisper
+    # in the background while Jarvis is talking.
+    mic: dict = {}
+    calib = threading.Thread(target=lambda: mic.setdefault(
+        "l", Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.6)), daemon=True)
+    calib.start()
     speaker = make_speaker(cfg)
-    listener = Listener(cfg["silence"], 60.0, cfg["sensitivity"], calibrate_s=0.6)
-    transcriber = Transcriber(cfg["whisper"])
+    calib.join()
+    listener = mic["l"]
     listener.start_continuous()
+    model: dict = {}
+    loader = threading.Thread(target=lambda: model.setdefault("t", make_transcriber(cfg)), daemon=True)
+    loader.start()
+
+    def transcriber(audio):
+        loader.join()
+        return model["t"](audio)
 
     def say(line: str) -> None:
         speaker.say(line)
+        speaker.wait()
+
+    def speak_all() -> None:
+        for s in split_sentences(text):  # sentence by sentence: the first plays while the rest render
+            speaker.say(s)
         speaker.wait()
 
     barged = None
@@ -178,11 +442,10 @@ def turn(cfg: dict, text: str) -> str | None:
             if cfg["barge_in"]:
                 barge = BargeIn(listener, speaker, speaker.stop)
                 with barge.watch():
-                    speaker.say(text)
-                    speaker.wait()
+                    speak_all()
                 barged = barge.captured
             else:
-                say(text)
+                speak_all()
 
         deadline = time.time() + float(cfg["converse_timeout"])
         while True:
@@ -210,7 +473,7 @@ def turn(cfg: dict, text: str) -> str | None:
             if interrupted and is_pause_phrase(heard):
                 deadline = time.time() + float(cfg["converse_timeout"])
                 continue
-            if is_sleep_phrase(heard) or normalize(heard) in EXIT_PHRASES:
+            if is_sleep_phrase(heard) or is_exit_phrase(heard):
                 say(f"Very good, {address}. Standing by.")
                 return None
             return heard

@@ -114,6 +114,16 @@ class SaySpeaker:
             self.proc.terminate()
         self.busy.clear()
 
+    def trim(self):
+        """Finish the sentence being spoken, drop the rest."""
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+        if self.proc is None:
+            self.busy.clear()
+
     def output_level(self, t: float) -> float | None:
         return None  # unknown: `say` plays the audio itself
 
@@ -150,6 +160,8 @@ class ProcessedSpeaker:
         self.pending = 0
         self.lock = threading.Lock()
         self.generation = 0
+        self.playing_gen = None  # generation of the sentence playing right now
+        self.kept_gen = None     # an older generation trim() let finish
         self.busy = threading.Event()
         self.playing = None  # (monotonic start, loudness envelope), or "fallback"
         self.ir = _impulse_response()
@@ -186,10 +198,28 @@ class ProcessedSpeaker:
                 except queue.Empty:
                     pass
             self.pending = 0
+            self.kept_gen = None
             self.busy.clear()
         self.sd.stop()
         if self.fallback:
             self.fallback.stop()
+
+    def trim(self):
+        """Let the sentence that is playing finish, but drop everything after it, so a
+        newer utterance takes over at a sentence boundary instead of mid-word."""
+        with self.lock:
+            playing = self.playing_gen
+            self.generation += 1
+            for q in (self.text_q, self.audio_q):
+                try:
+                    while True:
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+            self.kept_gen = playing
+            self.pending = 1 if playing is not None else 0
+            if playing is None:
+                self.busy.clear()
 
     def output_level(self, t: float) -> float | None:
         """How loud the audio playing around monotonic time t is (None if unknown)."""
@@ -219,8 +249,10 @@ class ProcessedSpeaker:
     def _play_loop(self):
         while True:
             gen, audio, text = self.audio_q.get()
-            if gen != self.generation:
-                continue
+            with self.lock:
+                if gen != self.generation:
+                    continue
+                self.playing_gen = gen
             if audio is None:
                 if self.fallback:
                     self.playing = "fallback"
@@ -231,7 +263,12 @@ class ProcessedSpeaker:
                 self.playing = (time.monotonic(), env)
                 self.sd.play(audio, SR)
                 self.sd.wait()
-            if gen == self.generation:
+            with self.lock:
+                self.playing_gen = None
+                counted = gen == self.generation or gen == self.kept_gen
+                if gen == self.kept_gen:
+                    self.kept_gen = None
+            if counted:
                 self._done_one()
 
 

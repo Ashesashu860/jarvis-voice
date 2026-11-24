@@ -133,11 +133,12 @@ class Listener:
         return max(self.noise * self.sensitivity, 0.008)
 
     def listen(self, start_timeout: float | None = None,
-               prefix: list[np.ndarray] | None = None) -> np.ndarray | None:
+               prefix: list[np.ndarray] | None = None, on_start=None) -> np.ndarray | None:
         """Block until one utterance is captured. Returns None for a too-short sound,
         or when start_timeout passes with no speech (then self.timed_out is True).
         `prefix` is speech already under way (caught by BargeIn); recording carries
-        on from it until the speaker falls silent."""
+        on from it until the speaker falls silent. `on_start()` is called the moment
+        speech begins."""
         self.timed_out = False
         if not self.continuous:
             self._drain()
@@ -166,6 +167,8 @@ class Listener:
                     voiced = voiced + 1 if loud else 0
                     if voiced >= 3:
                         started, frames = True, list(preroll)
+                        if on_start:
+                            on_start()
                     continue
                 frames.append(f)
                 silent = 0 if loud else silent + 1
@@ -264,19 +267,40 @@ class BargeIn:
                 self.on_trigger()
 
 
+def vocabulary_prompt(vocabulary: str) -> str | None:
+    """Whisper's `initial_prompt`: a short glossary that nudges it towards the spelling
+    of names and jargon ("GNSC", "Next.js") it would otherwise guess at."""
+    words = [w.strip() for w in (vocabulary or "").split(",") if w.strip()]
+    return f"Glossary: {', '.join(words)}." if words else None
+
+
+def echoes_prompt(text: str, prompt: str | None) -> bool:
+    """Whisper sometimes just repeats its prompt over silence: treat that as noise."""
+    if not prompt:
+        return False
+    t, p = normalize(text), normalize(prompt)
+    return bool(t) and len(t.split()) >= 3 and t in p
+
+
 class Transcriber:
-    def __init__(self, model: str = "base.en"):
+    def __init__(self, model: str = "base.en", vocabulary: str = ""):
         import os
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         from faster_whisper import WhisperModel
         self.model = WhisperModel(model, device="cpu", compute_type="int8")
+        self.prompt = vocabulary_prompt(vocabulary)
 
     def __call__(self, audio: np.ndarray) -> str:
         segs, _ = self.model.transcribe(
             audio, language="en", beam_size=1, vad_filter=True,
-            condition_on_previous_text=False, temperature=0.0,
+            condition_on_previous_text=False, temperature=0.0, initial_prompt=self.prompt,
             no_speech_threshold=NO_SPEECH_PROB, log_prob_threshold=MIN_AVG_LOGPROB,
             compression_ratio_threshold=MAX_COMPRESSION_RATIO,
         )
-        return " ".join(s.text.strip() for s in segs if keep_segment(s)).strip()
+        text = " ".join(s.text.strip() for s in segs if keep_segment(s)).strip()
+        return "" if echoes_prompt(text, self.prompt) else text
+
+
+def make_transcriber(cfg: dict) -> Transcriber:
+    return Transcriber(cfg["whisper"], cfg.get("vocabulary", ""))

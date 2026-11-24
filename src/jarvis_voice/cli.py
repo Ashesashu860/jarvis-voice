@@ -64,6 +64,26 @@ def extract_wake(text: str) -> tuple[str | None, bool]:
     return (rest or None), True
 
 
+def _command_words(text: str) -> str:
+    """Normalized text with polite filler and a trailing 'Jarvis' removed."""
+    from .ears import normalize
+    n = normalize(text)
+    for filler in ("ok ", "okay ", "please ", "jarvis "):
+        n = n.removeprefix(filler)
+    return n.removesuffix(" please").removesuffix(" jarvis").strip()
+
+
+def is_exit_phrase(text: str) -> bool:
+    """Only the whole utterance counts: 'shut down the dev server' is a request, not an exit."""
+    return _command_words(text) in EXIT_PHRASES
+
+
+def is_reset_phrase(text: str) -> bool:
+    """Only the whole utterance counts: 'make it start over at the end' is a request."""
+    n = _command_words(text)
+    return n in RESET_PHRASES or n.removeprefix("lets ") in RESET_PHRASES
+
+
 def is_sleep_phrase(text: str) -> bool:
     from .ears import normalize
     n = normalize(text)
@@ -72,7 +92,7 @@ def is_sleep_phrase(text: str) -> bool:
 
 def cmd_talk(args, cfg) -> int:
     from .brain import Brain
-    from .ears import BargeIn, Listener, Transcriber, is_noise, normalize
+    from .ears import BargeIn, Listener, make_transcriber, is_noise
     from .voice import chime, describe, make_speaker
 
     if not shutil.which("claude"):
@@ -84,7 +104,7 @@ def cmd_talk(args, cfg) -> int:
     listener = transcriber = None
     if not args.type:
         print(f"{C_DIM}Loading speech recognition ({cfg['whisper']})...{C_RST}")
-        transcriber = Transcriber(cfg["whisper"])
+        transcriber = make_transcriber(cfg)
         print(f"{C_DIM}Calibrating microphone, stay quiet for a second...{C_RST}")
         listener = Listener(cfg["silence"], 30.0, cfg["sensitivity"])
 
@@ -205,12 +225,11 @@ def cmd_talk(args, cfg) -> int:
                     standby_notice()
                     continue
 
-            n = normalize(prompt)
-            if any(n == p or n.startswith(p) for p in EXIT_PHRASES):
+            if is_exit_phrase(prompt):
                 speaker.say(f"Very good, {address}. Powering down.")
                 finish_speaking()
                 return 0
-            if any(p in n for p in RESET_PHRASES):
+            if is_reset_phrase(prompt):
                 brain.session_id = None
                 speaker.say(f"Of course, {address}. Starting a fresh conversation.")
                 finish_speaking()
@@ -239,12 +258,12 @@ def cmd_talk(args, cfg) -> int:
 # ----------------------------------------------------------------------------- listen / say
 def cmd_listen(args, cfg) -> int:
     """Record one spoken prompt and print its transcript (used by /jarvis:listen)."""
-    from .ears import Listener, Transcriber, is_noise
+    from .ears import Listener, make_transcriber, is_noise
     from .hooks import hush
     from .voice import chime
 
     hush()
-    transcriber = Transcriber(cfg["whisper"])
+    transcriber = make_transcriber(cfg)
     listener = Listener(cfg["silence"], args.max_seconds, cfg["sensitivity"], calibrate_s=0.8)
     chime("Tink", cfg, wait=True)  # finish the chime so it isn't recorded as speech
     print("Listening... speak now.", file=sys.stderr, flush=True)
@@ -292,10 +311,6 @@ def cmd_say(args, cfg) -> int:
     else:
         text = sys.stdin.read()
     cfg = {**cfg, **{k: v for k, v in voice_overrides(args).items() if v is not None}}
-    if args.listen:
-        from .converse import speak_listening
-        speak_listening(cfg, text)
-        return 0
     speaker = make_speaker(cfg)
     for s in split_sentences(text):
         speaker.say(s)
@@ -365,6 +380,11 @@ def cmd_daemon(args, cfg) -> int:
     return daemon.serve(args.first)
 
 
+def cmd_watch(args, cfg) -> int:
+    from .converse import watch
+    return watch(cfg, args.session)
+
+
 def cmd_hook(args, cfg) -> int:
     from .hooks import run
     return run(args.event)
@@ -429,8 +449,8 @@ def cmd_setup(args, cfg) -> int:
     print("1/4 Voice model (Kokoro, ~350 MB, one time)")
     ensure_kokoro()
     print("2/4 Speech recognition model (Whisper)")
-    from .ears import Transcriber
-    Transcriber(cfg["whisper"])
+    from .ears import make_transcriber
+    make_transcriber(cfg)
     print("3/4 Microphone check (your OS may ask for permission)")
     try:
         import numpy as np
@@ -500,7 +520,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text", nargs="*")
     p.add_argument("--file")
     p.add_argument("--delete", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--listen", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_say)
 
     sub.add_parser("hush", help="stop speaking").set_defaults(func=cmd_hush)
@@ -529,6 +548,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", action="store_true", help="show what the daemon is doing")
     p.add_argument("--first", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_daemon)
+
+    p = sub.add_parser("watch", help=argparse.SUPPRESS)
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("hook", help=argparse.SUPPRESS)
     p.add_argument("event", choices=["stop", "prompt", "tool", "tool-done"])

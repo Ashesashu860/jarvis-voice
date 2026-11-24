@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from types import SimpleNamespace
 
@@ -178,6 +179,10 @@ def test_stop_hook_blocks_with_spoken_reply(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(converse, "STATE_FILE", tmp_path / "converse.json")
     monkeypatch.setattr(converse, "INBOX_FILE", tmp_path / "inbox.jsonl")
     monkeypatch.setattr(converse, "CAPTURE_FILE", tmp_path / "capturing")
+    monkeypatch.setattr(converse, "WATCH_FILE", tmp_path / "watch.json")
+    monkeypatch.setattr(converse, "HALT_FILE", tmp_path / "halt.json")
+    from jarvis_voice import daemon as _daemon
+    monkeypatch.setattr(_daemon, "request", lambda *a, **k: None)  # never touch the real daemon
     monkeypatch.delenv("JARVIS_VOICE_CHILD", raising=False)
     spoken = []
     monkeypatch.setattr(converse, "turn", lambda cfg, text: spoken.append(text) or "what time is it")
@@ -256,6 +261,9 @@ class FakeSpeaker:
     def stop(self):
         self.busy.clear()
 
+    def trim(self):
+        self.trimmed = True  # keeps "playing" the current sentence until released
+
 
 def _daemon_with(fake):
     d = daemon.SpeechDaemon(idle_s=60)
@@ -279,8 +287,9 @@ def test_daemon_same_session_replaces_other_session_waits():
     d.say("Reply from B.", "B", None)       # another session: waits its turn
     _time.sleep(0.05)
     assert fake.said == ["Reply from A."] and d.status()["queued"] == 1
-    d.say("Newer reply from A.", "A", None)  # same session: cuts A off; joins the back of the line
-    assert _until(lambda: d.status()["session"] == "B")
+    d.say("Newer reply from A.", "A", None)  # same session: A finishes its sentence, newer joins the line
+    _time.sleep(0.05)
+    assert getattr(fake, "trimmed", False) and d.status()["session"] == "A"
     fake.release.set()
     assert _until(lambda: fake.said == ["Reply from A.", "Reply from B.", "Newer reply from A."])
     assert _until(lambda: not d.status()["busy"])
@@ -337,3 +346,150 @@ def test_hush_leaves_other_sessions_listening_process(tmp_path, monkeypatch):
     assert killed == [] and config.PID_FILE.exists()
     hooks.hush("A")
     assert killed == [4242] and not config.PID_FILE.exists()
+
+
+def test_daemon_reports_recent_speech_and_gentle_hush():
+    fake = FakeSpeaker()
+    d = _daemon_with(fake)
+    d.say("Running the tests.", "A", None)
+    assert _until(lambda: fake.said == ["Running the tests."])
+    assert d.status()["recent"] == ["Running the tests."]
+    d.hush(None, gentle=True)
+    assert getattr(fake, "trimmed", False)
+    fake.release.set()
+    assert _until(lambda: not d.status()["busy"])
+    d.stop()
+
+
+def test_vocabulary_prompt_and_prompt_echo():
+    from jarvis_voice.ears import echoes_prompt, vocabulary_prompt
+    p = vocabulary_prompt("Jarvis, GNSC , Next.js,")
+    assert p == "Glossary: Jarvis, GNSC, Next.js."
+    assert vocabulary_prompt("") is None
+    assert echoes_prompt("Glossary: Jarvis, GNSC.", p)
+    assert not echoes_prompt("Open GNSC", p)
+
+
+def test_stop_task_and_echo_detection():
+    from jarvis_voice.converse import is_echo, is_stop_task
+    assert is_stop_task("Jarvis, cancel that.") and is_stop_task("Stop the task please")
+    assert not is_stop_task("stop the server on port 3000 and restart it")
+    assert is_echo("noted sir", ["Noted, sir."])
+    assert is_echo("Running the tests", ["Tests written. Running the tests now."])
+    assert not is_echo("also update the readme", ["Running the tests now."])
+
+
+def test_halt_denies_tools_until_stop(tmp_path, monkeypatch, capsys):
+    from jarvis_voice import converse
+    for name in ("STATE_FILE", "HALT_FILE", "WATCH_FILE", "INBOX_FILE", "CAPTURE_FILE"):
+        monkeypatch.setattr(converse, name, tmp_path / name)
+    monkeypatch.setattr(converse, "ensure_watcher", lambda s: None)
+    converse.STATE_FILE.write_text(json.dumps({"session": "S", "since": _time.time()}))
+    converse.halt("S", "cancel that")
+    monkeypatch.setattr(hooks, "_read_input", lambda: {"session_id": "S", "tool_name": "Bash", "tool_input": {}})
+    hooks.on_tool()
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert converse.halted("other") is None
+
+
+def test_speaker_trim_finishes_current_sentence_only(monkeypatch):
+    from jarvis_voice import voice
+
+    played, gate = [], threading.Event()
+
+    class FakeSD:
+        def play(self, audio, sr):
+            played.append(float(audio[0]))
+        def wait(self):
+            gate.wait(2)
+        def stop(self):
+            gate.set()
+
+    class Stub(voice.ProcessedSpeaker):
+        def render(self, text):
+            return np.full(10, float(len(played) + len(text)), dtype=np.float32)
+
+    monkeypatch.setattr(voice, "_impulse_response", lambda: None)
+    sp = Stub(fx=0.0, fallback=None)
+    sp.sd = FakeSD()
+    for s in ("One.", "Two.", "Three."):
+        sp.say(s)
+    assert _until(lambda: len(played) == 1)   # "One." is playing
+    sp.trim()
+    sp.say("New.")
+    gate.set()                                 # let playback run freely
+    assert _until(lambda: not sp.busy.is_set())
+    assert len(played) == 2                    # "One." finished, then straight to "New."
+
+
+def test_talk_is_owned_by_the_session_that_typed_it(tmp_path, monkeypatch):
+    from jarvis_voice import converse
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(converse, "STATE_FILE", tmp_path / "converse.json")
+    monkeypatch.setattr(converse, "OWNER_FILE", tmp_path / "converse-owner.json")
+    # prompt hook first, then `jarvis converse`
+    converse.note_owner("a")
+    converse.start()
+    assert not converse.claim("b")   # a busy second window can't take it
+    assert converse.claim("a")
+    converse.end()
+    # `jarvis converse` first, then the prompt hook
+    converse.start()
+    converse.note_owner("a")
+    assert not converse.claim("b")
+    assert converse.claim("a")
+    converse.end()
+    assert not (tmp_path / "converse-owner.json").exists()
+    assert converse.TALK_COMMAND.match("/jarvis:talk") and not converse.TALK_COMMAND.match("/jarvis:talkative")
+
+
+def test_exit_and_reset_need_the_whole_phrase():
+    from jarvis_voice.cli import is_exit_phrase, is_reset_phrase
+    assert is_exit_phrase("Goodbye.") and is_exit_phrase("Shut down, please.")
+    assert is_exit_phrase("Goodbye, Jarvis.")
+    assert not is_exit_phrase("Shut down the dev server.")
+    assert not is_exit_phrase("Goodbye message should be friendlier")
+    assert is_reset_phrase("New conversation.") and is_reset_phrase("Let's start over.")
+    assert not is_reset_phrase("Make the animation start over at the end.")
+
+
+def test_brain_survives_lots_of_stderr(tmp_path, monkeypatch):
+    """A child that floods stderr used to deadlock against the unread pipe."""
+    import sys
+
+    from jarvis_voice import brain
+    fake = tmp_path / "claude"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "sys.stderr.write('x' * 500_000)\n"
+        "print(json.dumps({'type': 'stream_event', 'event': {'type': 'content_block_delta',"
+        " 'delta': {'type': 'text_delta', 'text': 'Done, sir.'}}}))\n"
+        "print(json.dumps({'type': 'result', 'session_id': 's1'}))\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    said = []
+
+    class Spk:
+        def say(self, t):
+            said.append(t)
+
+    b = brain.Brain("sir")
+    b.ask("hi", Spk())
+    assert said == ["Done, sir."] and b.session_id == "s1" and b.proc is None
+
+
+def test_last_reply_reads_from_the_end(tmp_path):
+    import json as _json
+    p = tmp_path / "t.jsonl"
+    user = {"type": "user", "message": {"content": "do it"}}
+    tool = {"type": "user", "message": {"content": [{"type": "tool_result"}]}}
+    def say(t):
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}
+    filler = [say("old " + "y" * 3000) for _ in range(200)]  # ~600 KB, many chunks
+    rows = [*filler, user, say("Working on it."), tool, say("All done, sir."), tool]
+    p.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+    assert hooks.last_reply_from_transcript(str(p)) == "All done, sir."
+    p.write_text("\n".join(_json.dumps(r) for r in [*filler, user]))  # no trailing newline
+    assert hooks.last_reply_from_transcript(str(p)) == ""

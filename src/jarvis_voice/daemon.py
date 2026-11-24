@@ -3,11 +3,13 @@ well under a second instead of ~3 s, and arbitrates between Claude Code sessions
 
 Protocol: one JSON object per line over a Unix socket in the cache dir.
   {"op": "say", "text": ..., "session": ..., "ttl": seconds | null}
-  {"op": "hush", "session": ... | null}      null = everything
+  {"op": "hush", "session": ... | null, "gentle": bool}   null = everything;
+                                              gentle = finish the current sentence first
   {"op": "status"}  /  {"op": "quit"}
 
 Rules:
-  * a new utterance from a session replaces whatever that session was saying;
+  * a new utterance from a session replaces whatever that session was saying, at the
+    end of the sentence being spoken (never mid-word);
   * an utterance from another session waits its turn (two voices at once is no help);
   * an utterance with a `ttl` (progress narration) is dropped if it can't start in time;
   * hushing a session only silences that session.
@@ -29,6 +31,7 @@ from . import config
 SOCK = config.CACHE_DIR / "speechd.sock"
 LOCK = config.CACHE_DIR / "speechd.lock"
 LOG = config.CACHE_DIR / "speechd.log"
+RECENT_S = 60.0  # how long status reports what was said (for echo filtering)
 VOICE_KEYS = ("engine", "blend", "speed", "fx", "edge_voice", "edge_rate", "edge_pitch", "mac_voice", "mac_rate")
 
 
@@ -69,6 +72,19 @@ def speak(text: str, session: str | None = None, ttl: float | None = None) -> No
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
+def settle(limit_s: float = 8.0) -> None:
+    """Drop queued speech, let the current sentence finish, and wait until quiet."""
+    if request("hush", session=None, gentle=True) is None:
+        return
+    end = time.time() + limit_s
+    while time.time() < end:
+        st = request("status")
+        if not st or not st.get("busy"):
+            return
+        time.sleep(0.1)
+    request("hush", session=None)
+
+
 def running() -> bool:
     return request("status") is not None
 
@@ -88,6 +104,7 @@ class SpeechDaemon:
         self.wake = threading.Condition(self.lock)
         self.queue: list[_Job] = []
         self.current: _Job | None = None
+        self.recent: list[tuple[float, str]] = []  # (wall time, text) recently spoken
         self.speaker = None
         self.voice_sig = None
         self.last_active = time.monotonic()
@@ -97,15 +114,15 @@ class SpeechDaemon:
     def say(self, text: str, session, ttl) -> dict:
         with self.lock:
             if session is not None:
-                self._cancel(session)
+                self._cancel(session, gentle=True)
             self.queue.append(_Job(text, session, ttl))
             self.last_active = time.monotonic()
             self.wake.notify()
             return {"ok": True, "position": len(self.queue) - 1 + (self.current is not None)}
 
-    def hush(self, session=None) -> dict:
+    def hush(self, session=None, gentle: bool = False) -> dict:
         with self.lock:
-            self._cancel(session)
+            self._cancel(session, gentle)
             return {"ok": True}
 
     def status(self) -> dict:
@@ -113,16 +130,19 @@ class SpeechDaemon:
             cur = self.current
             return {"ok": True, "pid": os.getpid(), "busy": cur is not None,
                     "session": cur.session if cur else None, "queued": len(self.queue),
-                    "engine": (self.voice_sig or {}).get("engine")}
+                    "engine": (self.voice_sig or {}).get("engine"),
+                    "recent": [t for at, t in self.recent if time.time() - at < RECENT_S]}
 
-    def _cancel(self, session) -> None:
-        """Drop queued jobs and stop the current one, for one session or (None) for all."""
+    def _cancel(self, session, gentle: bool = False) -> None:
+        """Drop queued jobs and stop the current one, for one session or (None) for all.
+        `gentle` lets the sentence being spoken finish first."""
         match = (lambda j: True) if session is None else (lambda j: j.session == session)
         self.queue = [j for j in self.queue if not match(j)]
         if self.current and match(self.current):
             self.current.cancelled = True
             if self.speaker:
-                self.speaker.stop()
+                trim = getattr(self.speaker, "trim", None) if gentle else None
+                (trim or self.speaker.stop)()
 
     # -- speaking (worker thread)
     def _ensure_speaker(self, idle_for: float) -> None:
@@ -149,6 +169,8 @@ class SpeechDaemon:
                 if job.deadline and time.monotonic() > job.deadline:
                     continue  # stale progress update: no longer worth saying
                 self.current = job  # from here a hush marks it cancelled
+                self.recent = [(at, t) for at, t in self.recent if time.time() - at < RECENT_S][-7:]
+                self.recent.append((time.time(), job.text))
             try:
                 self._ensure_speaker(time.monotonic() - idle_since)
             except Exception as e:
@@ -206,7 +228,7 @@ def _handle(conn: socket.socket, d: SpeechDaemon) -> bool:
         if op == "say":
             resp = d.say(str(req.get("text") or ""), req.get("session"), req.get("ttl"))
         elif op == "hush":
-            resp = d.hush(req.get("session"))
+            resp = d.hush(req.get("session"), bool(req.get("gentle")))
         elif op == "status":
             resp = d.status()
         elif op == "quit":
