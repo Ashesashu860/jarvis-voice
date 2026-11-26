@@ -119,29 +119,37 @@ class SaySpeaker:
 
     def __init__(self, voice: str | None = None, rate: int = 185):
         self.voice, self.rate = pick_mac_voice(voice), rate
-        self.q: queue.Queue[str] = queue.Queue()
+        self.q: queue.Queue[tuple[str, str | None]] = queue.Queue()
         self.proc: subprocess.Popen | None = None
         self.busy = threading.Event()
+        self.on_play = None  # callback(event: "start" | "end", tag) as each piece plays
         self.cmd = system_voice_command(self.voice, rate)
         self.available = self.cmd is not None
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
-            text = self.q.get()
+            text, tag = self.q.get()
+            if self.on_play:
+                self.on_play("start", tag)
             if self.available:
                 self.proc = subprocess.Popen([*self.cmd, text],
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.proc.wait()
                 self.proc = None
+            if self.on_play:
+                self.on_play("end", tag)
             if self.q.empty():
                 self.busy.clear()
 
-    def say(self, text: str):
+    def say(self, text: str, tag: str | None = None) -> bool:
+        """Queue one piece; False if nothing in it is speakable."""
         text = clean_for_speech(text)
-        if text:
-            self.busy.set()
-            self.q.put(text)
+        if not text:
+            return False
+        self.busy.set()
+        self.q.put((text, tag))
+        return True
 
     def wait(self):
         while self.busy.is_set():
@@ -208,6 +216,7 @@ class ProcessedSpeaker:
         self.busy = threading.Event()
         self.playing = None  # (monotonic start, loudness envelope), or "fallback"
         self.first_start = None  # when audio first played since this was last reset (timing log)
+        self.on_play = None  # callback(event: "start" | "end", tag) as each piece plays
         self.ir = _impulse_response()
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
@@ -219,14 +228,17 @@ class ProcessedSpeaker:
         return process(self.synth(text), self.fx, self.ir)
 
     # -- public
-    def say(self, text: str):
+    def say(self, text: str, tag: str | None = None) -> bool:
+        """Queue one piece; False if nothing in it is speakable. `tag` is handed back
+        through `on_play` when the piece starts and finishes playing."""
         text = clean_for_speech(text)
         if not text:
-            return
+            return False
         with self.lock:
             self.pending += 1
             self.busy.set()
-        self.text_q.put((self.generation, text))
+        self.text_q.put((self.generation, text, tag))
+        return True
 
     def wait(self):
         while self.busy.is_set():
@@ -281,22 +293,24 @@ class ProcessedSpeaker:
 
     def _synth_loop(self):
         while True:
-            gen, text = self.text_q.get()
+            gen, text, tag = self.text_q.get()
             if gen != self.generation:
                 continue
             try:
-                self.audio_q.put((gen, self.render(text), text))
+                self.audio_q.put((gen, self.render(text), text, tag))
             except Exception as e:  # offline / model hiccup -> macOS voice
                 log(f"[voice engine error: {type(e).__name__}: {e}; using fallback voice]")
-                self.audio_q.put((gen, None, text))
+                self.audio_q.put((gen, None, text, tag))
 
     def _play_loop(self):
         while True:
-            gen, audio, text = self.audio_q.get()
+            gen, audio, text, tag = self.audio_q.get()
             with self.lock:
                 if gen != self.generation:
                     continue
                 self.playing_gen = gen
+            if self.on_play:
+                self.on_play("start", tag)
             if audio is None:
                 if self.fallback:
                     self.playing = "fallback"
@@ -314,6 +328,8 @@ class ProcessedSpeaker:
                 counted = gen == self.generation or gen == self.kept_gen
                 if gen == self.kept_gen:
                     self.kept_gen = None
+            if self.on_play:
+                self.on_play("end", tag)
             if counted:
                 self._done_one()
 

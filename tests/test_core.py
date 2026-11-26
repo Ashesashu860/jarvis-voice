@@ -861,3 +861,84 @@ def test_stop_hook_ignores_capture_left_by_a_dead_listener(tmp_path, monkeypatch
     t0 = _time.monotonic()
     converse.wait_for_capture()
     assert _time.monotonic() - t0 < 0.5
+
+
+# ----------------------------------------------------------------------------- playback events (jarvis-rt)
+class TaggedSpeaker:
+    """Plays its queue when released, calling on_play like the real speakers do."""
+
+    def __init__(self):
+        self.on_play = None
+        self.busy = threading.Event()
+        self.release = threading.Event()
+        self.items: list[tuple[str, object]] = []
+        self.first_start = None
+
+    def say(self, text, tag=None):
+        self.items.append((text, tag))
+        self.busy.set()
+        return True
+
+    def wait(self):
+        self.release.wait(2)
+        while self.items:
+            text, tag = self.items.pop(0)
+            self.on_play("start", tag)
+            self.on_play("end", tag)
+        self.busy.clear()
+
+    def stop(self):
+        self.items.clear()
+        self.busy.clear()
+
+    trim = stop
+
+
+def _tagged_daemon():
+    import socket as _socket
+    sp = TaggedSpeaker()
+    d = daemon.SpeechDaemon(idle_s=60)
+
+    def ensure(idle_for):
+        d.speaker = sp
+        sp.on_play = d._on_play
+    d._ensure_speaker = ensure
+    threading.Thread(target=d.worker, daemon=True).start()
+    ours, theirs = _socket.socketpair()
+    d.subscribe(ours)
+    theirs.settimeout(2)
+    return d, sp, theirs
+
+
+def _events(sock, n):
+    buf = b""
+    while buf.count(b"\n") < n:
+        buf += sock.recv(4096)
+    return [json.loads(line) for line in buf.decode().splitlines()[:n]]
+
+
+def test_daemon_reports_tag_start_and_end_and_appends_join_the_reply():
+    d, sp, sub = _tagged_daemon()
+    d.say("One. Two.", "rt", None, append=True, tag="t1#0")
+    assert _until(lambda: d.status()["busy"])
+    r = d.say("Three.", "rt", None, append=True, tag="t1#1")
+    assert r.get("joined")  # joined the reply being spoken: no gap, no new job
+    assert [t for t, _ in sp.items] == ["One. ", "Two.", "Three."]
+    sp.release.set()
+    evs = _events(sub, 4)
+    assert [(e["event"], e["tag"]) for e in evs] == [
+        ("start", "t1#0"), ("end", "t1#0"), ("start", "t1#1"), ("end", "t1#1")]
+    assert all(e["dropped"] is False for e in evs if e["event"] == "end")
+    d.stop()
+
+
+def test_daemon_hush_reports_unplayed_tags_as_dropped():
+    d, sp, sub = _tagged_daemon()
+    d.say("Long reply.", "rt", None, append=True, tag="t2#0")
+    assert _until(lambda: d.status()["busy"])
+    d.say("Other window.", "cc", None, tag="other")  # another session waits in the queue
+    d.hush("rt")
+    evs = _events(sub, 1)
+    assert evs[0]["event"] == "end" and evs[0]["tag"] == "t2#0" and evs[0]["dropped"] is True
+    sp.release.set()
+    d.stop()

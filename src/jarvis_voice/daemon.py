@@ -12,7 +12,16 @@ Protocol: one JSON object per line over a Unix socket in the cache dir.
   {"op": "level", "t": monotonic time}        how loud playback is around t (barge-in)
   {"op": "transcribe", "audio": base64 float32 16 kHz mono}  -> {"text": ...}
   {"op": "warm", "stt": bool}                 load the voice (and Whisper) ahead of use
+  {"op": "subscribe"}                         keep the connection open and receive one
+                                              line per playback event (below)
   {"op": "status"}  /  {"op": "quit"}
+
+A `say` may carry a `tag`. Subscribers then get, for that text:
+  {"event": "start", "tag": ..., "at": epoch ms}   its first sentence began playing
+  {"event": "end",   "tag": ..., "at": epoch ms,   its last sentence finished, or it was
+   "dropped": bool}                                hushed/skipped before it could play
+With `append`, a session's text joins the reply it is already speaking, so the next
+sentence is rendered while the current one plays (no gap between streamed sentences).
 
 Rules:
   * a new utterance from a session replaces whatever that session was saying, at the
@@ -62,9 +71,10 @@ def request(op: str, timeout: float = 0.5, **fields) -> dict | None:
         return None
 
 
-def speak(text: str, session: str | None = None, ttl: float | None = None, append: bool = False) -> None:
+def speak(text: str, session: str | None = None, ttl: float | None = None, append: bool = False,
+          tag: str | None = None) -> None:
     """Hand text to the daemon, starting it (with the text) if it isn't running."""
-    job = {"text": text, "session": session, "ttl": ttl, "append": append}
+    job = {"text": text, "session": session, "ttl": ttl, "append": append, "tag": tag}
     if request("say", **job) is None:
         _spawn({"op": "say", **job})
 
@@ -185,8 +195,8 @@ class DaemonSpeaker:
 
 # ============================================================================= server
 class _Job:
-    def __init__(self, text: str, session, ttl):
-        self.text, self.session = text, session
+    def __init__(self, text: str, session, ttl, tag=None):
+        self.text, self.session, self.tag = text, session, tag
         self.created = time.monotonic()
         self.deadline = self.created + ttl if ttl else None
         self.cancelled = False
@@ -208,13 +218,25 @@ class SpeechDaemon:
         self.stt = None
         self.stt_sig = None
         self.stt_lock = threading.Lock()    # one transcription at a time
+        self.subscribers: list[socket.socket] = []
+        self.sub_lock = threading.Lock()
+        self.tags: dict[str, dict] = {}     # tag -> {"left": pieces still to play, "session", "started"}
 
     # -- requests (called from the socket threads)
-    def say(self, text: str, session, ttl, append: bool = False) -> dict:
+    def say(self, text: str, session, ttl, append: bool = False, tag=None) -> dict:
+        from .text import split_sentences
         with self.lock:
+            cur = self.current
+            if (append and session is not None and cur is not None and cur.session == session
+                    and not cur.cancelled and self.speaker is not None):
+                # Join the reply being spoken: its speaker renders this while the current
+                # sentence plays.
+                self._queue_pieces(split_sentences(text), session, tag)
+                self.last_active = time.monotonic()
+                return {"ok": True, "position": 0, "joined": True}
             if session is not None and not append:
                 self._cancel(session, gentle=True)
-            self.queue.append(_Job(text, session, ttl))
+            self.queue.append(_Job(text, session, ttl, tag))
             self.last_active = time.monotonic()
             self.wake.notify()
             return {"ok": True, "position": len(self.queue) - 1 + (self.current is not None)}
@@ -290,10 +312,69 @@ class SpeechDaemon:
                 self.stt, self.stt_sig = make_transcriber(cfg), sig
             return _Locked(self.stt, self.stt_lock)
 
+    # -- playback events (subscribers)
+    def subscribe(self, conn: socket.socket) -> None:
+        with self.sub_lock:
+            self.subscribers.append(conn)
+
+    def unsubscribe(self, conn: socket.socket) -> None:
+        with self.sub_lock:
+            if conn in self.subscribers:
+                self.subscribers.remove(conn)
+
+    def _emit(self, event: str, tag, **extra) -> None:
+        if tag is None:
+            return
+        line = (json.dumps({"event": event, "tag": tag, "at": round(time.time() * 1000), **extra}) + "\n").encode()
+        with self.sub_lock:
+            for conn in list(self.subscribers):
+                try:
+                    conn.sendall(line)
+                except OSError:
+                    self.subscribers.remove(conn)
+
+    def _queue_pieces(self, pieces: list[str], session, tag) -> None:
+        """Hand pieces to the speaker (caller holds self.lock), tracking the tag."""
+        queued = sum(1 for p in pieces if self.speaker.say(p, tag=tag)) if tag else 0
+        if tag is None:
+            for p in pieces:
+                self.speaker.say(p)
+            return
+        if queued == 0:
+            self._emit("end", tag, dropped=True)  # nothing speakable in it
+            return
+        t = self.tags.setdefault(tag, {"left": 0, "session": session, "started": False})
+        t["left"] += queued
+
+    def _on_play(self, event: str, tag) -> None:
+        """Called from the speaker's player thread as each piece starts and ends."""
+        if tag is None:
+            return
+        with self.lock:
+            t = self.tags.get(tag)
+            if t is None:
+                return  # hushed meanwhile: already reported as dropped
+            if event == "start":
+                if t["started"]:
+                    return
+                t["started"] = True
+            else:
+                t["left"] -= 1
+                if t["left"] > 0:
+                    return
+                del self.tags[tag]
+        self._emit(event, tag, **({"dropped": False} if event == "end" else {}))
+
     def _cancel(self, session, gentle: bool = False) -> None:
         """Drop queued jobs and stop the current one, for one session or (None) for all.
         `gentle` lets the sentence being spoken finish first."""
         match = (lambda j: True) if session is None else (lambda j: j.session == session)
+        for j in self.queue:
+            if match(j):
+                self._emit("end", j.tag, dropped=True)
+        for tag in [k for k, t in self.tags.items() if session is None or t["session"] == session]:
+            del self.tags[tag]
+            self._emit("end", tag, dropped=True)
         self.queue = [j for j in self.queue if not match(j)]
         if self.current and match(self.current):
             self.current.cancelled = True
@@ -310,6 +391,7 @@ class SpeechDaemon:
             if self.speaker:
                 self.speaker.stop()
             self.speaker, self.voice_sig = make_speaker(cfg), sig
+            self.speaker.on_play = self._on_play
         elif idle_for > 2.0:
             _refresh_audio_devices()  # follow headphones plugged in since we last spoke
 
@@ -324,6 +406,7 @@ class SpeechDaemon:
                     return
                 job = self.queue.pop(0)
                 if job.deadline and time.monotonic() > job.deadline:
+                    self._emit("end", job.tag, dropped=True)
                     continue  # stale progress update: no longer worth saying
                 self.current = job  # from here a hush marks it cancelled
                 self.recent = [(at, t) for at, t in self.recent if time.time() - at < RECENT_S][-7:]
@@ -336,17 +419,22 @@ class SpeechDaemon:
             with self.lock:
                 if job.cancelled or self.speaker is None:
                     self.current = None
+                    if not job.cancelled:
+                        self._emit("end", job.tag, dropped=True)
                     continue
                 self.speaker.first_start = None
-                for s in quick_start(split_sentences(job.text)):
-                    self.speaker.say(s)
-            self.speaker.wait()
+                self._queue_pieces(quick_start(split_sentences(job.text)), job.session, job.tag)
+            # Text appended to this reply keeps the speaker busy: wait until it's all played.
+            while True:
+                self.speaker.wait()
+                with self.lock:
+                    if not self.speaker.busy.is_set() or job.cancelled:
+                        self.current = None  # under the same lock as the check: no late join
+                        self.last_active = idle_since = time.monotonic()
+                        break
             first = getattr(self.speaker, "first_start", None)
             if first and not job.cancelled:
                 _log(f"spoke for {str(job.session)[:8]}: first audio {first - job.created:.2f}s after the request")
-            with self.lock:
-                self.current = None
-                self.last_active = idle_since = time.monotonic()
 
     # -- lifecycle
     def idle_expired(self) -> bool:
@@ -420,7 +508,19 @@ def _handle(conn: socket.socket, d: SpeechDaemon) -> bool:
         op = req.get("op")
         if op == "say":
             resp = d.say(str(req.get("text") or ""), req.get("session"), req.get("ttl"),
-                         bool(req.get("append")))
+                         bool(req.get("append")), req.get("tag"))
+        elif op == "subscribe":
+            d.subscribe(conn)
+            try:
+                conn.sendall(b'{"ok": true}\n')
+                conn.settimeout(None)
+                while conn.recv(1024):  # held open until the subscriber disconnects
+                    pass
+            except OSError:
+                pass
+            finally:
+                d.unsubscribe(conn)
+            return True
         elif op == "hush":
             resp = d.hush(req.get("session"), bool(req.get("gentle")))
         elif op == "status":
@@ -479,7 +579,7 @@ def serve(first: str | None = None) -> int:
             d.warm(bool(first_job.get("stt")))
         else:  # "say" (or the pre-0.5 format, which had no op)
             d.say(first_job.get("text") or "", first_job.get("session"), first_job.get("ttl"),
-                  bool(first_job.get("append")))
+                  bool(first_job.get("append")), first_job.get("tag"))
     threading.Thread(target=d.worker, daemon=True).start()
 
     try:
